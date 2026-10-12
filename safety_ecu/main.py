@@ -25,9 +25,18 @@ from risk.bns import BNSCalculator
 from risk.pms import PMSCalculator
 from risk.risk_manager import RiskManager
 
+from carla.receiver_v2 import CarlaReceiverV2
+
 
 DISTANCE_FRESHNESS_TIMEOUT = 0.5
 
+# -------------------------------------------------
+# Environment input mode
+# -------------------------------------------------
+INPUT_MODE_HARDWARE = "HARDWARE"
+INPUT_MODE_CARLA = "CARLA"
+
+INPUT_MODE = INPUT_MODE_CARLA
 
 def start_tof_process(data_queue):
     """
@@ -62,6 +71,18 @@ def main():
     logger = PedalLogger(
         "pedal_data.csv"
     )
+
+    # -------------------------------------------------
+    # CARLA receiver
+    # -------------------------------------------------
+    carla_receiver = None
+
+    if INPUT_MODE == INPUT_MODE_CARLA:
+        carla_receiver = CarlaReceiverV2(
+            host="192.168.50.2",
+            port=5006,
+            timeout=0.5,
+        )
 
     system_logger = SystemLogger(
         "system_data.csv"
@@ -117,6 +138,12 @@ def main():
     previous_failsafe_reason = None
 
     # -------------------------------------------------
+    # CARLA state logging
+    # -------------------------------------------------
+    last_carla_log_time = 0.0
+    CARLA_LOG_INTERVAL = 0.5
+
+    # -------------------------------------------------
     # CAN command transmission
     # -------------------------------------------------
     last_command_tx_time = 0.0
@@ -130,6 +157,13 @@ def main():
         # -------------------------------------------------
         receiver.open()
         sender.open()
+
+        # -------------------------------------------------
+        # Start CARLA UDP receiver
+        # -------------------------------------------------
+        if carla_receiver is not None:
+            carla_receiver.start()
+            print("[Safety ECU] CARLA receiver ready")
 
         # -------------------------------------------------
         # Start ToF worker
@@ -146,6 +180,21 @@ def main():
         )
 
         while True:
+            # =================================================
+            # CARLA UDP receive and freshness monitoring
+            # =================================================
+            if carla_receiver is not None:
+                if carla_receiver.receive():
+                    state.update_carla(carla_receiver)
+
+                if not carla_receiver.check_freshness():
+                    if state.carla_connected:
+                        print(
+                            "[CARLA] DATA TIMEOUT"
+                        )
+
+                    state.invalidate_carla()
+
             # =================================================
             # CAN receive
             # =================================================
@@ -574,19 +623,23 @@ def main():
             # =================================================
             # BNS calculation
             # =================================================
-            state.bns = (
-                bns_calculator.calculate(
-                    distance_cm=(
-                        state.distance_cm
-                    ),
-                    distance_valid=(
-                        state.distance_valid
-                    ),
-                    vehicle_speed=(
-                        state.vehicle_speed
-                    ),
-                    ttc=state.ttc,
-                )
+            # Select environment inputs for BNS
+            if INPUT_MODE == INPUT_MODE_CARLA:
+                bns_distance_cm = state.carla_distance_cm
+                bns_distance_valid = state.carla_distance_valid
+                bns_vehicle_speed = state.carla_vehicle_speed
+                bns_ttc = state.carla_ttc
+            else:
+                bns_distance_cm = state.distance_cm
+                bns_distance_valid = state.distance_valid
+                bns_vehicle_speed = state.vehicle_speed
+                bns_ttc = state.ttc
+
+            state.bns = bns_calculator.calculate(
+                distance_cm=bns_distance_cm,
+                distance_valid=bns_distance_valid,
+                vehicle_speed=bns_vehicle_speed,
+                ttc=bns_ttc,
             )
 
             # =================================================
@@ -630,7 +683,8 @@ def main():
             # Fail-safe evaluation
             # =================================================
             failsafe.evaluate(
-                state
+                state,
+                input_mode=INPUT_MODE,
             )
 
             if (
@@ -848,7 +902,36 @@ def main():
             # =================================================
             # State output
             # =================================================
-            if state.distance_valid:
+            # -------------------------------------------------
+            # CARLA state output
+            # -------------------------------------------------
+            if (
+                INPUT_MODE == INPUT_MODE_CARLA
+                and time.monotonic() - last_carla_log_time
+                >= CARLA_LOG_INTERVAL
+            ):
+                last_carla_log_time = time.monotonic()
+
+                print(
+                    f"[CARLA STATE] "
+                    f"CONNECTED={state.carla_connected} "
+                    f"SPEED={state.carla_vehicle_speed}km/h "
+                    f"DIST={state.carla_distance_cm}cm "
+                    f"DIST_VALID={state.carla_distance_valid} "
+                    f"CLOSING={state.carla_closing_speed_mps}m/s "
+                    f"TTC={state.carla_ttc}s "
+                    f"OBSTACLE_ID={state.carla_obstacle_id} "
+                    f"BNS={state.bns:.1f} "
+                    f"BNS_AVAILABLE={bns_calculator.available} "
+                    f"FAILSAFE={failsafe.active} "
+                    f"FAILSAFE_REASON={failsafe.reason}",
+                    flush=True
+                )
+
+            if (
+                INPUT_MODE == INPUT_MODE_HARDWARE
+                and state.distance_valid
+            ):
                 print(
                     f"[STATE] "
                     f"ACC={state.accelerator}% "
@@ -906,6 +989,14 @@ def main():
             )
 
         tof_queue.close()
+
+        sender.close()
+        receiver.close()
+
+        tof_queue.close()
+
+        if carla_receiver is not None:
+            carla_receiver.close()
 
         sender.close()
         receiver.close()

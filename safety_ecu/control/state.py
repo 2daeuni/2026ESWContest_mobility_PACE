@@ -39,6 +39,17 @@ class SystemState:
         self.ttc = None
 
         # -------------------------------------------------
+        # CARLA simulation
+        # -------------------------------------------------
+        self.carla_connected = False
+        self.carla_vehicle_speed = None
+        self.carla_distance_cm = None
+        self.carla_distance_valid = False
+        self.carla_closing_speed_mps = None
+        self.carla_ttc = None
+        self.carla_obstacle_id = None
+
+        # -------------------------------------------------
         # Haptic ECU
         # -------------------------------------------------
         self.haptic_risk_level = 0
@@ -192,3 +203,37 @@ class SystemState:
             return False
 
         return True
+
+    def update_carla(self, receiver):
+        self.carla_connected = receiver.connected
+
+        self.carla_vehicle_speed = (
+            receiver.vehicle_speed
+        )
+
+        self.carla_distance_cm = (
+            receiver.distance_m * 100.0
+            if receiver.distance_m is not None
+            else None
+        )
+
+        self.carla_distance_valid = (
+            receiver.connected
+            and receiver.distance_m is not None
+        )
+
+        self.carla_closing_speed_mps = (
+            receiver.closing_speed_mps
+        )
+
+        self.carla_ttc = receiver.ttc
+        self.carla_obstacle_id = receiver.obstacle_id
+
+    def invalidate_carla(self):
+        self.carla_connected = False
+        self.carla_vehicle_speed = None
+        self.carla_distance_cm = None
+        self.carla_distance_valid = False
+        self.carla_closing_speed_mps = None
+        self.carla_ttc = None
+        self.carla_obstacle_id = None
