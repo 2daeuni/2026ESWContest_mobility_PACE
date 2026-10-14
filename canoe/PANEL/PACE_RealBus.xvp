@@ -1,0 +1,257 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Panel Type="Vector.CANalyzer.Panels.PanelSerializer, Vector.CANalyzer.Panels.Serializer, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null">
+  <Object Type="Vector.CANalyzer.Panels.Runtime.Panel, Vector.CANalyzer.Panels.Common, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="Panel" ControlName="PACE_RealBus">
+    <Object Type="Vector.CANalyzer.Panels.Design.GroupBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="X03c1bc4ce2248e4150e8584e1ef43446e9b3" ControlName="Group Box 2">
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="X8aa2980ce808de4c44e8640e090e74c0893c" ControlName="Input/Output Box 13">
+        <Property Name="Name">X8aa2980ce808de4c44e8640e090e74c0893c</Property>
+        <Property Name="Size">151, 21</Property>
+        <Property Name="Location">16, 180</Property>
+        <Property Name="AlarmGeneralSettings">1;0;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">6</Property>
+        <Property Name="DescriptionText">모터 상태</Property>
+        <Property Name="ValueDisplay">Symbolic</Property>
+        <Property Name="UsedValueTable">RawValue</Property>
+        <Property Name="DescriptionSize">52, 21</Property>
+        <Property Name="SymbolConfiguration">8;2;PACE;Motor_ECU;MOTOR_STATUS;MotSts_MotorState;1;CAN;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="X2ed36c99e1189e4348e8fa4eb7e6cd2ba290" ControlName="Input/Output Box 12">
+        <Property Name="Name">X2ed36c99e1189e4348e8fa4eb7e6cd2ba290</Property>
+        <Property Name="Size">152, 21</Property>
+        <Property Name="Location">16, 153</Property>
+        <Property Name="AlarmGeneralSettings">1;2;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">5</Property>
+        <Property Name="DescriptionText">차량속도:</Property>
+        <Property Name="ValueDisplay">Double</Property>
+        <Property Name="UsedValueTable">PhysicalValue</Property>
+        <Property Name="DescriptionSize">53, 21</Property>
+        <Property Name="SymbolConfiguration">8;16;Motor;;;VehicleSpeedKmh;2;;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="X88c70f91e2f94e45ceeb4ececae628a376f3" ControlName="Input/Output Box 11">
+        <Property Name="Name">X88c70f91e2f94e45ceeb4ececae628a376f3</Property>
+        <Property Name="Size">166, 21</Property>
+        <Property Name="Location">16, 130</Property>
+        <Property Name="AlarmGeneralSettings">1;2;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">4</Property>
+        <Property Name="DescriptionText">출력제한(%)</Property>
+        <Property Name="ValueDecimalPlaces">0</Property>
+        <Property Name="ValueDisplay">Double</Property>
+        <Property Name="UsedValueTable">RawValue</Property>
+        <Property Name="DescriptionSize">67, 21</Property>
+        <Property Name="SymbolConfiguration">8;2;PACE;Motor_ECU;MOTOR_STATUS;MotSts_AppliedLimit;1;CAN;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="Xc96db357e65b9e4241e9445e245a629d2aab" ControlName="Input/Output Box 15">
+        <Property Name="Name">Xc96db357e65b9e4241e9445e245a629d2aab</Property>
+        <Property Name="Size">166, 21</Property>
+        <Property Name="Location">16, 103</Property>
+        <Property Name="AlarmGeneralSettings">1;2;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">3</Property>
+        <Property Name="DescriptionText">모터출력 PWM(%)</Property>
+        <Property Name="ValueDecimalPlaces">0</Property>
+        <Property Name="ValueDisplay">Double</Property>
+        <Property Name="UsedValueTable">RawValue</Property>
+        <Property Name="DescriptionSize">96, 21</Property>
+        <Property Name="SymbolConfiguration">8;2;PACE;Motor_ECU;MOTOR_STATUS;MotSts_ActualPWM;1;CAN;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.ProgressBarControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="Xf6538033eac59e406ee8d96e1ed7141a5daa" ControlName="Progress Bar 2">
+        <Property Name="Name">Xf6538033eac59e406ee8d96e1ed7141a5daa</Property>
+        <Property Name="Size">166, 15</Property>
+        <Property Name="Location">16, 82</Property>
+        <Property Name="ValueSize">40, 12</Property>
+        <Property Name="OriginValue">0</Property>
+        <Property Name="SymbolConfiguration">8;2;PACE;Motor_ECU;MOTOR_STATUS;MotSts_ActualPWM;1;CAN;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="Xab7925f8ee701e446deb06cee4a94cd04c76" ControlName="Input/Output Box 9">
+        <Property Name="Name">Xab7925f8ee701e446deb06cee4a94cd04c76</Property>
+        <Property Name="Size">98, 21</Property>
+        <Property Name="Location">70, 32</Property>
+        <Property Name="AlarmGeneralSettings">1;2;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">2</Property>
+        <Property Name="DescriptionText">Haptic(%)</Property>
+        <Property Name="ValueDecimalPlaces">0</Property>
+        <Property Name="ValueDisplay">Double</Property>
+        <Property Name="UsedValueTable">RawValue</Property>
+        <Property Name="DescriptionSize">54, 21</Property>
+        <Property Name="SymbolConfiguration">8;2;PACE;Haptic_ECU;HAPTIC_STATUS;HapSts_Intensity;1;CAN;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.LEDControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="Xa18d5920e36b4e41ecea8f1ee417f88462cb" ControlName="LED Control 3">
+        <Property Name="Name">Xa18d5920e36b4e41ecea8f1ee417f88462cb</Property>
+        <Property Name="Size">48, 48</Property>
+        <Property Name="Location">16, 18</Property>
+        <Property Name="ReadOnlyControl">True</Property>
+        <Property Name="TabIndex">1</Property>
+        <Property Name="TabStopActive">False</Property>
+        <Property Name="SwitchValuesVTXml">&lt;Version&gt;2&lt;/Version&gt;&lt;Count&gt;2&lt;/Count&gt;&lt;RxValue&gt;0&lt;/RxValue&gt;&lt;LowerUpper&gt;Lower&lt;/LowerUpper&gt;&lt;TxValue&gt;0&lt;/TxValue&gt;&lt;Color&gt;255, 152, 152, 152&lt;/Color&gt;&lt;RxValue&gt;1&lt;/RxValue&gt;&lt;LowerUpper&gt;Lower&lt;/LowerUpper&gt;&lt;TxValue&gt;1&lt;/TxValue&gt;&lt;Color&gt;Red&lt;/Color&gt;</Property>
+        <Property Name="SymbolConfiguration">8;16;Haptic;;;VibOutput;1;;;-1;;;Value;;;0</Property>
+      </Object>
+      <Property Name="Name">X03c1bc4ce2248e4150e8584e1ef43446e9b3</Property>
+      <Property Name="Size">300, 211</Property>
+      <Property Name="Location">580, 12</Property>
+      <Property Name="Text">Vehicle</Property>
+      <Property Name="TabIndex">3</Property>
+      <Property Name="UseWindowsStyle">False</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.GroupBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="X3cc5e4d6ea2c9e4585ea272e6713c0b13aea" ControlName="Group Box 1">
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="X9938281febde4e4bfaea8d0e1ce4c62044f2" ControlName="Input/Output Box 3">
+        <Property Name="Name">X9938281febde4e4bfaea8d0e1ce4c62044f2</Property>
+        <Property Name="Size">212, 21</Property>
+        <Property Name="Location">5, 86</Property>
+        <Property Name="AlarmGeneralSettings">1;2;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">8</Property>
+        <Property Name="DescriptionText">MotCmd_OutputLimit:</Property>
+        <Property Name="ValueDecimalPlaces">0</Property>
+        <Property Name="ValueDisplay">Double</Property>
+        <Property Name="UsedValueTable">RawValue</Property>
+        <Property Name="DescriptionSize">113, 21</Property>
+        <Property Name="SymbolConfiguration">8;2;PACE;Safety_ECU;MOTOR_COMMAND;MotCmd_OutputLimit;1;CAN;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="Xffb358dde79a8e4bd5ebec3e0c90544c2fcf" ControlName="Input/Output Box 2">
+        <Property Name="Name">Xffb358dde79a8e4bd5ebec3e0c90544c2fcf</Property>
+        <Property Name="Size">260, 21</Property>
+        <Property Name="Location">5, 59</Property>
+        <Property Name="AlarmGeneralSettings">1;0;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">7</Property>
+        <Property Name="DescriptionText">MotCmd_ControlMode:</Property>
+        <Property Name="ValueDisplay">Symbolic</Property>
+        <Property Name="UsedValueTable">RawValue</Property>
+        <Property Name="DescriptionSize">119, 21</Property>
+        <Property Name="SymbolConfiguration">8;2;PACE;Safety_ECU;MOTOR_COMMAND;MotCmd_ControlMode;1;CAN;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="Xe5aa8dfceef15e4199eaf42e2d3bb22cb2d3" ControlName="Input/Output Box 8">
+        <Property Name="Name">Xe5aa8dfceef15e4199eaf42e2d3bb22cb2d3</Property>
+        <Property Name="Size">260, 21</Property>
+        <Property Name="Location">5, 32</Property>
+        <Property Name="AlarmGeneralSettings">1;0;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">6</Property>
+        <Property Name="DescriptionText">HapCmd_RiskLevel:</Property>
+        <Property Name="ValueDisplay">Symbolic</Property>
+        <Property Name="UsedValueTable">RawValue</Property>
+        <Property Name="DescriptionSize">106, 21</Property>
+        <Property Name="SymbolConfiguration">8;2;PACE;Safety_ECU;HAPTIC_COMMAND;HapCmd_RiskLevel;1;CAN;;-1;;;Value;;;0</Property>
+      </Object>
+      <Property Name="Name">X3cc5e4d6ea2c9e4585ea272e6713c0b13aea</Property>
+      <Property Name="Size">283, 211</Property>
+      <Property Name="Location">291, 12</Property>
+      <Property Name="Text">Safety ECU</Property>
+      <Property Name="TabIndex">2</Property>
+      <Property Name="UseWindowsStyle">False</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.GroupBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="Xfbce2850e2c9ae4001e9281e35635d9e7aa0" ControlName="Group Box 4">
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="Xc94fc103ea747e4d59eb4f3edd8c47063df6" ControlName="Input/Output Box 1">
+        <Property Name="Name">Xc94fc103ea747e4d59eb4f3edd8c47063df6</Property>
+        <Property Name="Size">127, 21</Property>
+        <Property Name="Location">136, 82</Property>
+        <Property Name="AlarmGeneralSettings">1;2;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">4</Property>
+        <Property Name="DescriptionText">브레이크(%)</Property>
+        <Property Name="ValueDecimalPlaces">0</Property>
+        <Property Name="ValueDisplay">Decimal</Property>
+        <Property Name="UsedValueTable">PhysicalValue</Property>
+        <Property Name="DescriptionSize">67, 21</Property>
+        <Property Name="SymbolConfiguration">8;16;Pedal;;;BrakePedal;1;;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.TrackBarControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="X29af280cef784e41d3ea934ee8774ec2f5d6" ControlName="Track Bar 1">
+        <Property Name="Name">X29af280cef784e41d3ea934ee8774ec2f5d6</Property>
+        <Property Name="Size">119, 30</Property>
+        <Property Name="Location">11, 77</Property>
+        <Property Name="TabIndex">3</Property>
+        <Property Name="MaximumDouble">100</Property>
+        <Property Name="MaximumSize">100000, 30</Property>
+        <Property Name="Maximum">100</Property>
+        <Property Name="SymbolConfiguration">8;16;Pedal;;;BrakePedal;1;;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="X91d65999e8d2ae42a2eb83eee795df7a1dd9" ControlName="Input/Output Box 4">
+        <Property Name="Name">X91d65999e8d2ae42a2eb83eee795df7a1dd9</Property>
+        <Property Name="Size">127, 21</Property>
+        <Property Name="Location">136, 32</Property>
+        <Property Name="AlarmGeneralSettings">1;2;0;100</Property>
+        <Property Name="AlarmLowerBkgColor">Salmon</Property>
+        <Property Name="AlarmLowerTextColor">Black</Property>
+        <Property Name="AlarmUpperBkgColor">IndianRed</Property>
+        <Property Name="AlarmUpperTextColor">Black</Property>
+        <Property Name="BoxBorderStyle">FixedSingle</Property>
+        <Property Name="DisplayLabel">Left</Property>
+        <Property Name="TabIndex">2</Property>
+        <Property Name="DescriptionText">가속페달(%)</Property>
+        <Property Name="ValueDecimalPlaces">0</Property>
+        <Property Name="ValueDisplay">Decimal</Property>
+        <Property Name="UsedValueTable">PhysicalValue</Property>
+        <Property Name="DescriptionSize">67, 21</Property>
+        <Property Name="SymbolConfiguration">8;16;Pedal;;;AccelPedal;1;;;-1;;;Value;;;0</Property>
+      </Object>
+      <Object Type="Vector.CANalyzer.Panels.Design.TrackBarControl, Vector.CANalyzer.Panels.CommonControls, Version=18.0.150.0, Culture=neutral, PublicKeyToken=null" Name="X351e7f10e04cfe4059eaf28e9ea891d50fd6" ControlName="Track Bar 3">
+        <Property Name="Name">X351e7f10e04cfe4059eaf28e9ea891d50fd6</Property>
+        <Property Name="Size">119, 30</Property>
+        <Property Name="Location">11, 27</Property>
+        <Property Name="TabIndex">1</Property>
+        <Property Name="MaximumDouble">100</Property>
+        <Property Name="MaximumSize">100000, 30</Property>
+        <Property Name="Maximum">100</Property>
+        <Property Name="SymbolConfiguration">8;16;Pedal;;;AccelPedal;1;;;-1;;;Value;;;0</Property>
+      </Object>
+      <Property Name="Name">Xfbce2850e2c9ae4001e9281e35635d9e7aa0</Property>
+      <Property Name="Size">280, 211</Property>
+      <Property Name="Location">5, 12</Property>
+      <Property Name="Text">운전자 입력</Property>
+      <Property Name="TabIndex">1</Property>
+      <Property Name="UseWindowsStyle">False</Property>
+    </Object>
+    <Property Name="Name">Panel</Property>
+    <Property Name="Size">893, 234</Property>
+    <Property Name="Location">0, 0</Property>
+    <Property Name="BackColor">255, 255, 255, 255</Property>
+  </Object>
+</Panel>

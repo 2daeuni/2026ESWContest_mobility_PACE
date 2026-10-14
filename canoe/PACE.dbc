@@ -1,0 +1,173 @@
+VERSION ""
+
+
+NS_ : 
+	NS_DESC_
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+	CAT_DEF_
+	CAT_
+	FILTER
+	BA_DEF_DEF_
+	EV_DATA_
+	ENVVAR_DATA_
+	SGTYPE_
+	SGTYPE_VAL_
+	BA_DEF_SGTYPE_
+	BA_SGTYPE_
+	SIG_TYPE_REF_
+	VAL_TABLE_
+	SIG_GROUP_
+	SIG_VALTYPE_
+	SIGTYPE_VALTYPE_
+	BO_TX_BU_
+	BA_DEF_REL_
+	BA_REL_
+	BA_DEF_DEF_REL_
+	BU_SG_REL_
+	BU_EV_REL_
+	BU_BO_REL_
+	SG_MUL_VAL_
+
+BS_:
+
+BU_: Pedal_ECU Safety_ECU Haptic_ECU Motor_ECU
+
+
+BO_ 256 PEDAL_STATUS: 8 Pedal_ECU
+ SG_ Pdl_AccelPedal : 0|8@1+ (1,0) [0|100] "%" Safety_ECU,Motor_ECU
+ SG_ Pdl_BrakePedal : 8|8@1+ (1,0) [0|100] "%" Safety_ECU,Motor_ECU
+ SG_ Pdl_AccelRate : 16|16@1- (0.1,0) [-3276.8|3276.7] "%/s" Safety_ECU,Motor_ECU
+ SG_ Pdl_BrakeRate : 32|16@1- (0.1,0) [-3276.8|3276.7] "%/s" Safety_ECU,Motor_ECU
+ SG_ Pdl_Err_AccelAdcRange : 48|1@1+ (1,0) [0|1] "" Safety_ECU,Motor_ECU
+ SG_ Pdl_Err_BrakeAdcRange : 49|1@1+ (1,0) [0|1] "" Safety_ECU,Motor_ECU
+ SG_ Pdl_Err_AccelDisconnect : 50|1@1+ (1,0) [0|1] "" Safety_ECU,Motor_ECU
+ SG_ Pdl_Err_BrakeDisconnect : 51|1@1+ (1,0) [0|1] "" Safety_ECU,Motor_ECU
+ SG_ Pdl_Err_AccelCalib : 52|1@1+ (1,0) [0|1] "" Safety_ECU,Motor_ECU
+ SG_ Pdl_Err_BrakeCalib : 53|1@1+ (1,0) [0|1] "" Safety_ECU,Motor_ECU
+ SG_ Pdl_AliveCnt : 56|8@1+ (1,0) [0|255] "" Safety_ECU,Motor_ECU
+
+BO_ 272 HAPTIC_COMMAND: 8 Safety_ECU
+ SG_ HapCmd_RiskLevel : 0|8@1+ (1,0) [0|3] "" Haptic_ECU
+ SG_ HapCmd_VibCmd : 8|8@1+ (1,0) [0|1] "" Haptic_ECU
+ SG_ HapCmd_Intensity : 16|8@1+ (1,0) [0|100] "%" Haptic_ECU
+ SG_ HapCmd_Frequency : 24|8@1+ (1,0) [0|50] "Hz" Haptic_ECU
+ SG_ HapCmd_AliveCnt : 56|8@1+ (1,0) [0|255] "" Haptic_ECU
+
+BO_ 288 MOTOR_COMMAND: 8 Safety_ECU
+ SG_ MotCmd_ControlMode : 0|8@1+ (1,0) [0|2] "" Motor_ECU
+ SG_ MotCmd_OutputLimit : 8|8@1+ (1,0) [0|100] "%" Motor_ECU
+ SG_ MotCmd_RiskLevel : 16|8@1+ (1,0) [0|3] "" Motor_ECU
+ SG_ MotCmd_CmdValid : 24|1@1+ (1,0) [0|1] "" Motor_ECU
+ SG_ MotCmd_EStop : 25|1@1+ (1,0) [0|1] "" Motor_ECU
+ SG_ MotCmd_AliveCnt : 56|8@1+ (1,0) [0|255] "" Motor_ECU
+
+BO_ 512 HAPTIC_STATUS: 8 Haptic_ECU
+ SG_ HapSts_RiskLevel : 0|8@1+ (1,0) [0|3] "" Safety_ECU
+ SG_ HapSts_VibStatus : 8|8@1+ (1,0) [0|1] "" Safety_ECU
+ SG_ HapSts_Intensity : 16|8@1+ (1,0) [0|100] "%" Safety_ECU
+ SG_ HapSts_Frequency : 24|8@1+ (1,0) [0|50] "Hz" Safety_ECU
+ SG_ HapSts_FaultCode : 32|8@1+ (1,0) [0|255] "" Safety_ECU
+ SG_ HapSts_CmdTimeout : 40|8@1+ (1,0) [0|1] "" Safety_ECU
+ SG_ HapSts_EcuStatus : 48|8@1+ (1,0) [0|1] "" Safety_ECU
+ SG_ HapSts_AliveCnt : 56|8@1+ (1,0) [0|255] "" Safety_ECU
+
+BO_ 528 MOTOR_STATUS: 8 Motor_ECU
+ SG_ MotSts_ActualPWM : 0|8@1+ (1,0) [0|100] "%" Safety_ECU
+ SG_ MotSts_AppliedLimit : 8|8@1+ (1,0) [0|100] "%" Safety_ECU
+ SG_ MotSts_VehicleSpeed : 16|16@1+ (0.01,0) [0|655.35] "m/s" Safety_ECU
+ SG_ MotSts_MotorState : 32|8@1+ (1,0) [0|3] "" Safety_ECU
+ SG_ MotSts_DriverFault : 40|1@1+ (1,0) [0|1] "" Safety_ECU
+ SG_ MotSts_PedalTimeout : 41|1@1+ (1,0) [0|1] "" Safety_ECU
+ SG_ MotSts_CmdTimeout : 42|1@1+ (1,0) [0|1] "" Safety_ECU
+ SG_ MotSts_EStopActive : 43|1@1+ (1,0) [0|1] "" Safety_ECU
+ SG_ MotSts_AppliedCmdCnt : 48|8@1+ (1,0) [0|255] "" Safety_ECU
+ SG_ MotSts_AliveCnt : 56|8@1+ (1,0) [0|255] "" Safety_ECU
+
+
+
+CM_ "PACE CAN v1.0 - Classical CAN 2.0A, 500 kbps, DLC 8, 10 ms cyclic, Intel byte order, reserved = 0x00";
+CM_ BU_ Pedal_ECU "Accelerator / brake pedal sensor ECU";
+CM_ BU_ Safety_ECU "Raspberry Pi safety controller (risk level, fail-safe)";
+CM_ BU_ Haptic_ECU "Accelerator pedal vibration actuator ECU";
+CM_ BU_ Motor_ECU "Drive motor ECU (PWM, vehicle speed)";
+CM_ BO_ 256 "Pedal input and rate of change";
+CM_ BO_ 272 "Risk level and haptic command";
+CM_ BO_ 288 "Output limit / motor stop command (no direct PWM)";
+CM_ BO_ 512 "Haptic ECU applied state and fault";
+CM_ BO_ 528 "Motor applied PWM, vehicle speed and fault";
+CM_ SG_ 256 Pdl_AccelRate "Accelerator pedal rate of change, 0.1 %/s per bit, saturated at int16";
+CM_ SG_ 256 Pdl_BrakeRate "Brake pedal rate of change, 0.1 %/s per bit, saturated at int16";
+CM_ SG_ 256 Pdl_AliveCnt "Incremented on every transmission, 0..255 wrap";
+CM_ SG_ 272 HapCmd_VibCmd "0 = OFF (other fields ignored), 1 = ON";
+CM_ SG_ 272 HapCmd_Frequency "0 = OFF, 10..50 Hz when ON";
+CM_ SG_ 288 MotCmd_ControlMode "Normal: PWM from pedal; OutputLimit: min(PWM, limit); Stop: PWM 0";
+CM_ SG_ 288 MotCmd_CmdValid "Command valid bit (CommandFlags bit 0)";
+CM_ SG_ 288 MotCmd_EStop "Emergency stop bit (CommandFlags bit 1)";
+CM_ SG_ 512 HapSts_CmdTimeout "1 when HAPTIC_COMMAND not received for >= 50 ms";
+CM_ SG_ 512 HapSts_EcuStatus "Haptic ECU status: 0 = error, 1 = normal";
+CM_ SG_ 528 MotSts_VehicleSpeed "0.01 m/s per bit, 0xFFFF = invalid (distinct from 0.00 m/s)";
+CM_ SG_ 528 MotSts_AppliedCmdCnt "AliveCnt of the last applied MOTOR_COMMAND";
+BA_DEF_  "BusType" STRING ;
+BA_DEF_  "DBName" STRING ;
+BA_DEF_  "Baudrate" INT 0 1000000;
+BA_DEF_ BU_  "NodeLayerModules" STRING ;
+BA_DEF_ BO_  "GenMsgCycleTime" INT 0 65535;
+BA_DEF_ BO_  "GenMsgSendType" ENUM  "Cyclic","NotUsed","IfActive","OnWrite";
+BA_DEF_ BO_  "VFrameFormat" ENUM  "StandardCAN","ExtendedCAN","reserved","J1939PG";
+BA_DEF_ SG_  "GenSigStartValue" INT 0 65535;
+BA_DEF_DEF_  "BusType" "CAN";
+BA_DEF_DEF_  "DBName" "";
+BA_DEF_DEF_  "Baudrate" 500000;
+BA_DEF_DEF_  "NodeLayerModules" "";
+BA_DEF_DEF_  "GenMsgCycleTime" 0;
+BA_DEF_DEF_  "GenMsgSendType" "NotUsed";
+BA_DEF_DEF_  "VFrameFormat" "StandardCAN";
+BA_DEF_DEF_  "GenSigStartValue" 0;
+BA_ "BusType" "CAN";
+BA_ "DBName" "PACE";
+BA_ "Baudrate" 500000;
+BA_ "GenMsgCycleTime" BO_ 256 10;
+BA_ "GenMsgSendType" BO_ 256 0;
+BA_ "VFrameFormat" BO_ 256 0;
+BA_ "GenMsgCycleTime" BO_ 272 10;
+BA_ "GenMsgSendType" BO_ 272 0;
+BA_ "VFrameFormat" BO_ 272 0;
+BA_ "GenMsgCycleTime" BO_ 288 10;
+BA_ "GenMsgSendType" BO_ 288 0;
+BA_ "VFrameFormat" BO_ 288 0;
+BA_ "GenMsgCycleTime" BO_ 512 10;
+BA_ "GenMsgSendType" BO_ 512 0;
+BA_ "VFrameFormat" BO_ 512 0;
+BA_ "GenMsgCycleTime" BO_ 528 10;
+BA_ "GenMsgSendType" BO_ 528 0;
+BA_ "VFrameFormat" BO_ 528 0;
+BA_ "GenSigStartValue" SG_ 288 MotCmd_OutputLimit 100;
+BA_ "GenSigStartValue" SG_ 288 MotCmd_CmdValid 1;
+BA_ "GenSigStartValue" SG_ 528 MotSts_AppliedLimit 0;
+VAL_ 256 Pdl_Err_AccelAdcRange 1 "Error" 0 "OK" ;
+VAL_ 256 Pdl_Err_BrakeAdcRange 1 "Error" 0 "OK" ;
+VAL_ 256 Pdl_Err_AccelDisconnect 1 "Error" 0 "OK" ;
+VAL_ 256 Pdl_Err_BrakeDisconnect 1 "Error" 0 "OK" ;
+VAL_ 256 Pdl_Err_AccelCalib 1 "Error" 0 "OK" ;
+VAL_ 256 Pdl_Err_BrakeCalib 1 "Error" 0 "OK" ;
+VAL_ 272 HapCmd_RiskLevel 3 "Level3_Danger" 2 "Level2_Warning" 1 "Level1_Caution" 0 "Normal" ;
+VAL_ 272 HapCmd_VibCmd 1 "ON" 0 "OFF" ;
+VAL_ 288 MotCmd_ControlMode 2 "MotorStop" 1 "OutputLimit" 0 "Normal" ;
+VAL_ 288 MotCmd_RiskLevel 3 "Level3_Danger" 2 "Level2_Warning" 1 "Level1_Caution" 0 "Normal" ;
+VAL_ 288 MotCmd_CmdValid 1 "Valid" 0 "Invalid" ;
+VAL_ 288 MotCmd_EStop 1 "EStop" 0 "None" ;
+VAL_ 512 HapSts_RiskLevel 3 "Level3_Danger" 2 "Level2_Warning" 1 "Level1_Caution" 0 "Normal" ;
+VAL_ 512 HapSts_VibStatus 1 "ON" 0 "OFF" ;
+VAL_ 512 HapSts_FaultCode 4 "COMMUNICATION_FAULT" 3 "INVALID_COMMAND" 2 "DRIVER_FAULT" 1 "ACTUATOR_FAULT" 0 "NO_FAULT" ;
+VAL_ 512 HapSts_CmdTimeout 1 "Timeout" 0 "OK" ;
+VAL_ 512 HapSts_EcuStatus 1 "Normal" 0 "Error" ;
+VAL_ 528 MotSts_VehicleSpeed 65535 "Invalid" ;
+VAL_ 528 MotSts_MotorState 3 "Fault" 2 "OutputLimited" 1 "Running" 0 "Stop" ;
+VAL_ 528 MotSts_DriverFault 1 "Fault" 0 "OK" ;
+VAL_ 528 MotSts_PedalTimeout 1 "Timeout" 0 "OK" ;
+VAL_ 528 MotSts_CmdTimeout 1 "Timeout" 0 "OK" ;
+VAL_ 528 MotSts_EStopActive 1 "Active" 0 "Inactive" ;
+

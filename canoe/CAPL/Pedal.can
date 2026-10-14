@@ -1,0 +1,193 @@
+﻿/*@!Encoding:65001*/
+// Pedal ECU simulation node
+// Tx: PEDAL_STATUS (0x100), 10 ms
+// Inputs: sysvars Pedal::* (panel / test module)
+
+includes
+{
+}
+
+variables
+{
+  const int PACE_CYCLE_MS   = 10;   // all messages are 10 ms cyclic
+  const int PACE_TIMEOUT_MS = 50;   // common reception timeout (5 cycles)
+
+  message PEDAL_STATUS mPedal;
+  msTimer tCycle;
+
+  byte aliveCnt;
+  long prevAccel;
+  long prevBrake;
+
+  // Press-and-hold pedal buttons (Panel): pressed -> pedal goes down, released -> pedal springs back to 0
+  const float ACCEL_PRESS_RATE   = 40.0;    // accelerator press speed while held [%/s] (0 -> 100 in 2.5 s)
+  const float ACCEL_RELEASE_RATE = 150.0;   // accelerator spring-back speed [%/s]
+  const float BRAKE_PRESS_RATE   = 200.0;   // brake press speed while held [%/s] (0 -> 100 in 0.5 s)
+  const float BRAKE_RELEASE_RATE = 200.0;   // brake spring-back speed [%/s]
+  float accelF;      // pedal position while driven by the button [%]
+  float brakeF;
+  int   accelBtn;    // 1 while the button drives the accelerator (held or springing back)
+  int   brakeBtn;
+}
+
+on start
+{
+  aliveCnt  = 0;
+  prevAccel = clampL(@Pedal::AccelPedal, 0, 100);
+  prevBrake = clampL(@Pedal::BrakePedal, 0, 100);
+  accelF = 0;
+  brakeF = 0;
+  accelBtn = 0;
+  brakeBtn = 0;
+  setTimer(tCycle, PACE_CYCLE_MS);
+}
+
+// Simulation reset (Panel reset button): no rate spike after pedals are forced to 0
+on sysvar_update Safety::ObstacleReset
+{
+  if (@Safety::ObstacleReset != 1) return;
+  prevAccel = 0;
+  prevBrake = 0;
+  accelF = 0;
+  brakeF = 0;
+  accelBtn = 0;
+  brakeBtn = 0;
+  @Pedal::AccelHold = 0;
+  @Pedal::BrakeHold = 0;
+}
+
+on timer tCycle
+{
+  long  accel;
+  long  brake;
+  float accelRate;
+  float brakeRate;
+
+  setTimer(tCycle, PACE_CYCLE_MS);   // re-arm first to keep a fixed period
+
+  updatePedalButtons();
+
+  accel = clampL(@Pedal::AccelPedal, 0, 100);
+  brake = clampL(@Pedal::BrakePedal, 0, 100);
+
+  // Rate of change in %/s from the difference to the previous cycle
+  accelRate = (accel - prevAccel) * 1000.0 / PACE_CYCLE_MS;
+  brakeRate = (brake - prevBrake) * 1000.0 / PACE_CYCLE_MS;
+  prevAccel = accel;
+  prevBrake = brake;
+
+  // Test hooks: replace the computed rate with a fixed value
+  if (@Pedal::AccelRateOvrEn == 1) accelRate = @Pedal::AccelRateOvr;
+  if (@Pedal::BrakeRateOvrEn == 1) brakeRate = @Pedal::BrakeRateOvr;
+
+  // Simulate loss of PEDAL_STATUS (counter is not incremented while silent)
+  if (@Pedal::TxStop == 1) return;
+
+  mPedal.Pdl_AccelPedal = accel;
+  mPedal.Pdl_BrakePedal = brake;
+  mPedal.Pdl_AccelRate = rateToRaw(accelRate);
+  mPedal.Pdl_BrakeRate = rateToRaw(brakeRate);
+
+  mPedal.Pdl_Err_AccelAdcRange   = @Pedal::Err_AccelAdc;
+  mPedal.Pdl_Err_BrakeAdcRange   = @Pedal::Err_BrakeAdc;
+  mPedal.Pdl_Err_AccelDisconnect = @Pedal::Err_AccelDisc;
+  mPedal.Pdl_Err_BrakeDisconnect = @Pedal::Err_BrakeDisc;
+  mPedal.Pdl_Err_AccelCalib      = @Pedal::Err_AccelCal;
+  mPedal.Pdl_Err_BrakeCalib      = @Pedal::Err_BrakeCal;
+
+  mPedal.Pdl_AliveCnt = aliveCnt;
+  output(mPedal);
+  aliveCnt = nextCnt(aliveCnt);
+}
+
+// Pedal buttons (press-and-hold) and brake priority
+// Without the buttons the slider / input box values are used unchanged
+void updatePedalButtons()
+{
+  float dt;
+  dt = PACE_CYCLE_MS / 1000.0;
+
+  // Accelerator button
+  if (@Pedal::AccelHold == 1)
+  {
+    if (accelBtn == 0) accelF = @Pedal::AccelPedal;   // start from the current position
+    accelBtn = 1;
+    accelF = accelF + ACCEL_PRESS_RATE * dt;
+    if (accelF > 100) accelF = 100;
+    @Pedal::AccelPedal = roundL(accelF);
+  }
+  else if (accelBtn == 1)
+  {
+    accelF = accelF - ACCEL_RELEASE_RATE * dt;
+    if (accelF <= 0) { accelF = 0; accelBtn = 0; }
+    @Pedal::AccelPedal = roundL(accelF);
+  }
+
+  // Brake button
+  if (@Pedal::BrakeHold == 1)
+  {
+    if (brakeBtn == 0) brakeF = @Pedal::BrakePedal;
+    brakeBtn = 1;
+    brakeF = brakeF + BRAKE_PRESS_RATE * dt;
+    if (brakeF > 100) brakeF = 100;
+    @Pedal::BrakePedal = roundL(brakeF);
+  }
+  else if (brakeBtn == 1)
+  {
+    brakeF = brakeF - BRAKE_RELEASE_RATE * dt;
+    if (brakeF <= 0) { brakeF = 0; brakeBtn = 0; }
+    @Pedal::BrakePedal = roundL(brakeF);
+  }
+
+  // Brake priority: one foot -> while the brake is pressed the accelerator is 0
+  if (@Pedal::BrakePedal > 0)
+  {
+    if (@Pedal::AccelPedal != 0) @Pedal::AccelPedal = 0;
+    accelF = 0;
+    accelBtn = 0;
+  }
+
+  // Brake lamp for the Panel
+  if (@Pedal::BrakePedal > 0) { if (@Pedal::BrakeLamp != 1) @Pedal::BrakeLamp = 1; }
+  else                        { if (@Pedal::BrakeLamp != 0) @Pedal::BrakeLamp = 0; }
+}
+
+// %/s -> raw (0.1 %/s per bit), rounded and saturated to int16
+long rateToRaw(float ratePctPerSec)
+{
+  return clampL(roundL(ratePctPerSec / 0.1), -32768, 32767);
+}
+
+// ---- Common helpers ----
+// Current measurement time in milliseconds (timeNow() is in 10 us units)
+float nowMs()
+{
+  return timeNow() / 100.0;
+}
+
+// Round half away from zero
+long roundL(float x)
+{
+  if (x >= 0) return (long)(x + 0.5);
+  return (long)(x - 0.5);
+}
+
+long clampL(long x, long lo, long hi)
+{
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+long minL(long a, long b)
+{
+  if (a < b) return a;
+  return b;
+}
+
+// Alive counter: 0 -> 255 -> 0
+byte nextCnt(byte cnt)
+{
+  if (cnt >= 255) return 0;
+  return cnt + 1;
+}
