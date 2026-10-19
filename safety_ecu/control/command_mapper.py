@@ -74,8 +74,8 @@ class CommandMapper:
                     "frequency": 20,
                 },
                 "motor": {
-                    "control_mode": 0,
-                    "output_limit": 100,
+                    "control_mode": 1,
+                    "output_limit": 30,
                     "command_flags": 1,
                 },
             }
@@ -89,8 +89,8 @@ class CommandMapper:
                     "frequency": 30,
                 },
                 "motor": {
-                    "control_mode": 1,
-                    "output_limit": 30,
+                    "control_mode": 2,
+                    "output_limit": 0,
                     "command_flags": 1,
                 },
             }

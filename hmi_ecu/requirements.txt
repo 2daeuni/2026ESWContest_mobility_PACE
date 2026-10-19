@@ -1,0 +1,4 @@
+# safety_ecu/requirements.txt 와 동일 버전 (Pi 5 aarch64 pip wheel 존재)
+# QML 의 Shape.CurveRenderer 사용 → PySide6 6.6 이상 필요
+PySide6==6.11.2
+python-can==4.6.1

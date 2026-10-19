@@ -1,6 +1,4 @@
 import time
-import multiprocessing
-import queue
 
 from canbus.receiver import CANReceiver
 from canbus.sender import CANSender
@@ -19,16 +17,15 @@ from control.command_mapper import CommandMapper
 
 from logger.pedal_logger import PedalLogger
 from logger.system_logger import SystemLogger
-from sensors.tof_worker import tof_worker
+from logger.pedal_diagnostics import PedalDiagnostics
 
 from risk.bns import BNSCalculator
 from risk.pms import PMSCalculator
 from risk.risk_manager import RiskManager
 
 from carla.receiver_v2 import CarlaReceiverV2
-
-
-DISTANCE_FRESHNESS_TIMEOUT = 0.5
+from carla.control_sender import CarlaControlSender
+from hmi_sender import HmiSender
 
 # -------------------------------------------------
 # Environment input mode
@@ -37,27 +34,6 @@ INPUT_MODE_HARDWARE = "HARDWARE"
 INPUT_MODE_CARLA = "CARLA"
 
 INPUT_MODE = INPUT_MODE_CARLA
-
-def start_tof_process(data_queue):
-    """
-    Start a new ToF worker process.
-    """
-
-    process = multiprocessing.Process(
-        target=tof_worker,
-        args=(data_queue,),
-        daemon=True,
-    )
-
-    process.start()
-
-    print(
-        f"[Safety ECU] "
-        f"ToF worker started "
-        f"(PID={process.pid})"
-    )
-
-    return process
 
 def main():
     # -------------------------------------------------
@@ -89,6 +65,7 @@ def main():
     )
 
     failsafe = FailSafeManager()
+    pedal_diagnostics = PedalDiagnostics()
     command_mapper = CommandMapper()
     # Motor ECU status
     motor_status = None
@@ -101,6 +78,8 @@ def main():
     bns_calculator = BNSCalculator()
     pms_calculator = PMSCalculator()
     risk_manager = RiskManager()
+    hmi_sender = HmiSender()
+    carla_control_sender = CarlaControlSender()
 
     # -------------------------------------------------
     # Pedal communication monitoring
@@ -118,20 +97,6 @@ def main():
     haptic_timeout_reported = False
 
     # -------------------------------------------------
-    # ToF process
-    # -------------------------------------------------
-    tof_queue = multiprocessing.Queue()
-
-    tof_process = None
-
-    last_tof_restart_attempt = 0.0
-
-    # -------------------------------------------------
-    # Distance freshness monitoring
-    # -------------------------------------------------
-    distance_timeout_reported = False
-
-    # -------------------------------------------------
     # Fail-safe monitoring
     # -------------------------------------------------
     previous_failsafe_active = None
@@ -142,6 +107,9 @@ def main():
     # -------------------------------------------------
     last_carla_log_time = 0.0
     CARLA_LOG_INTERVAL = 0.5
+    last_risk_log_time = 0.0
+    RISK_LOG_INTERVAL = 0.5
+    last_risk_debug_time = 0.0
 
     # -------------------------------------------------
     # CAN command transmission
@@ -152,6 +120,7 @@ def main():
     motor_alive_counter = 0
 
     try:
+        hmi_sender.start()
         # -------------------------------------------------
         # Open CAN
         # -------------------------------------------------
@@ -165,13 +134,6 @@ def main():
             carla_receiver.start()
             print("[Safety ECU] CARLA receiver ready")
 
-        # -------------------------------------------------
-        # Start ToF worker
-        # -------------------------------------------------
-        tof_process = start_tof_process(
-            tof_queue
-        )
-
         print("[Safety ECU] Started")
 
         print(
@@ -180,6 +142,8 @@ def main():
         )
 
         while True:
+            pedal_diagnostic_sample = None
+            pedal_diagnostic_accepted = False
             # =================================================
             # CARLA UDP receive and freshness monitoring
             # =================================================
@@ -211,6 +175,9 @@ def main():
                     msg.arbitration_id
                     == PEDAL_STATUS_ID
                 ):
+                    pedal_diagnostic_sample = pedal_diagnostics.capture(
+                        msg.data, msg.timestamp
+                    )
                     try:
                         pedal = decode_pedal_status(
                             msg.data
@@ -327,6 +294,7 @@ def main():
                             state.update_pedal(
                                 pedal
                             )
+                            pedal_diagnostic_accepted = True
 
                             logger.log(
                                 state
@@ -487,140 +455,6 @@ def main():
                     )
 
             # =================================================
-            # Receive data from ToF worker
-            # =================================================
-            while True:
-                try:
-                    tof_message = (
-                        tof_queue.get_nowait()
-                    )
-
-                except queue.Empty:
-                    break
-
-                message_type = (
-                    tof_message.get("type")
-                )
-
-                if message_type == "connected":
-                    state.tof_connected = True
-
-                    print(
-                        "[ToF] "
-                        "Sensor connected"
-                    )
-
-                elif message_type == "distance":
-                    distance = (
-                        tof_message["distance_cm"]
-                    )
-
-                    state.update_distance(
-                        distance
-                    )
-
-                    distance_timeout_reported = (
-                        False
-                    )
-
-                elif (
-                    message_type
-                    == "disconnected"
-                ):
-                    if state.tof_connected:
-                        print(
-                            "[ToF] "
-                            "Sensor disconnected"
-                        )
-
-                    state.tof_connected = False
-
-                    state.invalidate_distance()
-
-                    print(
-                        f"[ToF STATE] "
-                        f"TOF_CONNECTED="
-                        f"{state.tof_connected} "
-                        f"DIST_VALID="
-                        f"{state.distance_valid}"
-                    )
-
-            # =================================================
-            # Check ToF worker
-            # =================================================
-            if (
-                tof_process is None
-                or not tof_process.is_alive()
-            ):
-                state.tof_connected = False
-
-                state.invalidate_distance()
-
-                current_time = (
-                    time.monotonic()
-                )
-
-                if (
-                    current_time
-                    - last_tof_restart_attempt
-                    >= 1.0
-                ):
-
-                    last_tof_restart_attempt = (
-                        current_time
-                    )
-
-                    if tof_process is not None:
-                        tof_process.join(
-                            timeout=0.1
-                        )
-
-                    print(
-                        "[Safety ECU] "
-                        "Restarting ToF worker..."
-                    )
-
-                    tof_process = (
-                        start_tof_process(
-                            tof_queue
-                        )
-                    )
-
-            # =================================================
-            # Distance freshness check
-            # =================================================
-            was_distance_valid = (
-                state.distance_valid
-            )
-
-            state.check_distance_freshness(
-                timeout=DISTANCE_FRESHNESS_TIMEOUT
-            )
-
-            if (
-                was_distance_valid
-                and not state.distance_valid
-                and state.tof_connected
-            ):
-                if not distance_timeout_reported:
-                    print(
-                        "[ToF] "
-                        "DISTANCE DATA TIMEOUT"
-                    )
-
-                    print(
-                        f"[ToF STATE] "
-                        f"TOF_CONNECTED="
-                        f"{state.tof_connected} "
-                        f"DIST_VALID="
-                        f"{state.distance_valid}"
-                    )
-
-                    distance_timeout_reported = (
-                        True
-                    )
-
-            # =================================================
             # BNS calculation
             # =================================================
             # Select environment inputs for BNS
@@ -640,6 +474,8 @@ def main():
                 distance_valid=bns_distance_valid,
                 vehicle_speed=bns_vehicle_speed,
                 ttc=bns_ttc,
+                closing_speed_mps=(state.carla_closing_speed_mps if INPUT_MODE == INPUT_MODE_CARLA else None),
+                environment_connected=(state.carla_connected if INPUT_MODE == INPUT_MODE_CARLA else bns_distance_valid),
             )
 
             # =================================================
@@ -659,6 +495,8 @@ def main():
                     sensor_status=(
                         state.pedal_sensor_status
                     ),
+                    brake=state.brake,
+                    brake_rate=state.brake_rate,  # signed %/s (decoder int16 LE * 0.1)
                 )
             )
 
@@ -677,7 +515,21 @@ def main():
                 pms_available=(
                     pms_calculator.available
                 ),
+                level1_conditions=(bns_calculator.distance_l1, bns_calculator.ttc_l1, pms_calculator.pedal_l1),
+                level2_conditions=(bns_calculator.distance_l2, bns_calculator.ttc_l2, pms_calculator.pedal_l2),
+                level3_conditions=(bns_calculator.distance_l3, bns_calculator.ttc_l3, pms_calculator.pedal_l3),
             )
+
+            risk_log_time = time.monotonic()
+            if risk_log_time - last_risk_log_time >= RISK_LOG_INTERVAL:
+                last_risk_log_time = risk_log_time
+                print(
+                    f"[RISK] BNS={state.bns:.2f} PMS={state.pms:.2f} "
+                    f"TOTAL={state.total_risk:.2f} LEVEL=L{state.risk_level} "
+                    f"DIST={bns_distance_cm / 100.0 if bns_distance_cm is not None else None}m "
+                    f"TTC={bns_ttc}s ACC={state.accelerator}% ACC_RATE={state.accelerator_rate:.1f}%/s "
+                    f"CANDIDATE=L{risk_manager.candidate_level}", flush=True,
+                )
 
             # =================================================
             # Fail-safe evaluation
@@ -686,6 +538,14 @@ def main():
                 state,
                 input_mode=INPUT_MODE,
             )
+
+            if pedal_diagnostic_sample is not None:
+                pedal_diagnostics.report(
+                    pedal_diagnostic_sample,
+                    pedal_diagnostic_accepted,
+                    state,
+                    failsafe,
+                )
 
             if (
                 failsafe.active
@@ -814,6 +674,21 @@ def main():
                             "command_flags": 0x01,
                         }
 
+                if current_time - last_risk_debug_time >= 0.5:
+                    last_risk_debug_time = current_time
+                    print(
+                        f"[RISKDBG] OBS={int(state.carla_obstacle_present if INPUT_MODE == INPUT_MODE_CARLA else bns_distance_valid)} "
+                        f"DIST={bns_distance_cm / 100.0 if bns_distance_cm is not None else None} "
+                        f"TTC={bns_ttc} CLOSING={state.carla_closing_speed_mps if INPUT_MODE == INPUT_MODE_CARLA else None} "
+                        f"BNS={state.bns:.3f} PMS={state.pms:.3f} "
+                        + " ".join(f"D{i}={int(getattr(bns_calculator, f'distance_l{i}'))}" for i in (1, 2, 3)) + " "
+                        + " ".join(f"T{i}={int(getattr(bns_calculator, f'ttc_l{i}'))}" for i in (1, 2, 3)) + " "
+                        + " ".join(f"P{i}={int(getattr(pms_calculator, f'pedal_l{i}'))}" for i in (1, 2, 3))
+                        + f" CAND=L{risk_manager.candidate_level} LEVEL=L{state.risk_level} "
+                        f"CMD_MODE={commands['motor']['control_mode']} LIMIT={commands['motor']['output_limit']}",
+                        flush=True,
+                    )
+
                 # ---------------------------------------------
                 # Haptic command
                 # ---------------------------------------------
@@ -889,6 +764,25 @@ def main():
                         failsafe.reason
                     ),
                     commands=commands,
+                )
+
+                carla_control_sender.send(
+                    commands["motor"], state.risk_level, failsafe.active,
+                    now=current_time,
+                )
+
+                # Snapshot final commands after Motor E-STOP/recovery overrides.
+                # JSON encoding and UDP transmission run outside the control loop.
+                hmi_sender.publish(
+                    state,
+                    input_mode=INPUT_MODE,
+                    bns_available=bns_calculator.available,
+                    pms_available=pms_calculator.available,
+                    risk_available=risk_manager.available,
+                    failsafe_active=failsafe.active,
+                    failsafe_reason=failsafe.reason,
+                    commands=commands,
+                    motor_connected=motor_status_fresh,
                 )
 
                 haptic_alive_counter = (
@@ -975,26 +869,8 @@ def main():
         )
 
     finally:
-        # -------------------------------------------------
-        # Stop ToF worker
-        # -------------------------------------------------
-        if (
-            tof_process is not None
-            and tof_process.is_alive()
-        ):
-            tof_process.terminate()
-
-            tof_process.join(
-                timeout=1.0
-            )
-
-        tof_queue.close()
-
-        sender.close()
-        receiver.close()
-
-        tof_queue.close()
-
+        carla_control_sender.close()
+        hmi_sender.close()
         if carla_receiver is not None:
             carla_receiver.close()
 
@@ -1003,8 +879,4 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method(
-        "spawn"
-    )
-
     main()

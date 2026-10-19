@@ -8,19 +8,14 @@ class FailSafeManager:
 
     def evaluate(self, state, input_mode="HARDWARE"):
 
-        if input_mode == self.MODE_HARDWARE:
-            if not state.tof_connected:
-                self.active = True
-                self.reason = "TOF_COMMUNICATION_ERROR"
-                return self.active
-
-        elif input_mode == self.MODE_CARLA:
+        # ToF hardware is retired; only CARLA requires an environment link.
+        if input_mode == self.MODE_CARLA:
             if not state.carla_connected:
                 self.active = True
                 self.reason = "CARLA_COMMUNICATION_ERROR"
                 return self.active
 
-        else:
+        elif input_mode != self.MODE_HARDWARE:
             self.active = True
             self.reason = "INVALID_INPUT_MODE"
             return self.active

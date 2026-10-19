@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=PACE HMI
+Comment=PACE pedal safety HMI (auto start)
+# 경로는 실제 클론 위치로 수정
+Exec=/home/pi/PACE-pedal-safety/hmi_ecu/scripts/run_hmi.sh
+X-GNOME-Autostart-enabled=true

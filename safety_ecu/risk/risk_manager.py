@@ -1,3 +1,6 @@
+import math
+
+
 class RiskManager:
     # -------------------------------------------------
     # Risk Level definitions
@@ -67,17 +70,9 @@ class RiskManager:
         """
         Evaluate integrated risk state.
 
-        Current stage:
-        - Track BNS availability
-        - Track PMS availability
-        - Determine integrated risk availability
-        - If Risk Level conditions are provided,
-          calculate candidate Risk Level
-        - Apply Risk Level state machine
-
-        Not implemented yet:
-        - Actual Total Risk calculation
-        - Actual Distance / TTC / Pedal thresholds
+        Total risk is max(BNS, PMS), bounded to [0,1]. Level selection uses
+        the supplied distance/TTC/pedal boolean conditions, not score bands.
+        Existing 3-up/5-down confirmation policy is unchanged.
         """
 
         self.bns_available = bns_available
@@ -102,24 +97,12 @@ class RiskManager:
                 self.risk_level,
             )
 
-        # -------------------------------------------------
-        # Total Risk calculation
-        # -------------------------------------------------
-        #
-        # Actual calculation will be implemented after
-        # BNS / PMS tuning is completed.
-        # -------------------------------------------------
+        def normalized(value):
+            if type(value) not in (int, float) or not math.isfinite(value):
+                return 0.0
+            return max(0.0, min(1.0, value))
 
-        self.total_risk = 0.0
-
-        # -------------------------------------------------
-        # Risk Level state machine
-        # -------------------------------------------------
-        #
-        # Conditions are optional for now because
-        # actual Distance / TTC / Pedal thresholds
-        # have not been finalized yet.
-        # -------------------------------------------------
+        self.total_risk = max(normalized(bns), normalized(pms))
 
         if (
             level1_conditions is not None

@@ -48,6 +48,7 @@ class SystemState:
         self.carla_closing_speed_mps = None
         self.carla_ttc = None
         self.carla_obstacle_id = None
+        self.carla_obstacle_present = False
 
         # -------------------------------------------------
         # Haptic ECU
@@ -222,12 +223,17 @@ class SystemState:
             and receiver.distance_m is not None
         )
 
-        self.carla_closing_speed_mps = (
-            receiver.closing_speed_mps
-        )
-
-        self.carla_ttc = receiver.ttc
-        self.carla_obstacle_id = receiver.obstacle_id
+        self.carla_obstacle_present = bool(receiver.connected and receiver.obstacle_id is not None)
+        self.carla_obstacle_id = receiver.obstacle_id if self.carla_obstacle_present else None
+        if self.carla_obstacle_present:
+            self.carla_closing_speed_mps = receiver.closing_speed_mps
+            self.carla_ttc = receiver.ttc
+        else:
+            # Fresh absence is safe; disconnected absence is unavailable.
+            self.carla_distance_cm = None
+            self.carla_distance_valid = False
+            self.carla_closing_speed_mps = 0.0 if receiver.connected else None
+            self.carla_ttc = None
 
     def invalidate_carla(self):
         self.carla_connected = False
@@ -237,3 +243,4 @@ class SystemState:
         self.carla_closing_speed_mps = None
         self.carla_ttc = None
         self.carla_obstacle_id = None
+        self.carla_obstacle_present = False

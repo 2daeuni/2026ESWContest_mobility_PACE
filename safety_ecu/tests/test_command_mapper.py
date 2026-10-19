@@ -173,13 +173,13 @@ def test_level_2():
 
     assert_equal(
         commands["motor"]["control_mode"],
-        0,
+        1,
         "Level 2 motor mode",
     )
 
     assert_equal(
         commands["motor"]["output_limit"],
-        100,
+        30,
         "Level 2 motor output limit",
     )
 
@@ -215,13 +215,13 @@ def test_level_3():
 
     assert_equal(
         commands["motor"]["control_mode"],
-        1,
+        2,
         "Level 3 motor mode",
     )
 
     assert_equal(
         commands["motor"]["output_limit"],
-        30,
+        0,
         "Level 3 motor output limit",
     )
 

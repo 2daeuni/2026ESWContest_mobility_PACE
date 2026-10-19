@@ -20,29 +20,24 @@ def assert_equal(actual, expected, message):
         )
 
 
-def test_tof_failure():
+def test_tof_not_required():
     state = SystemState()
     failsafe = FailSafeManager()
-
     state.tof_connected = False
+    state.pedal_connected = True
+    state.pedal_sensor_status = 0x00
+
+    assert_equal(failsafe.evaluate(state), False, "Retired ToF must not trigger fail-safe")
+    assert_equal(failsafe.reason, None, "Retired ToF must not set a reason")
+    state.carla_connected = True
+    assert_equal(failsafe.evaluate(state, "CARLA"), False, "CARLA must work without ToF")
+    state.carla_connected = False
+    assert_equal(failsafe.evaluate(state, "CARLA"), True, "CARLA timeout must remain protected")
+    assert_equal(failsafe.reason, "CARLA_COMMUNICATION_ERROR", "CARLA fault changed")
     state.pedal_connected = False
-    state.pedal_sensor_status = None
-
-    active = failsafe.evaluate(state)
-
-    assert_equal(
-        active,
-        True,
-        "ToF failure should activate fail-safe",
-    )
-
-    assert_equal(
-        failsafe.reason,
-        "TOF_COMMUNICATION_ERROR",
-        "Wrong fail-safe reason for ToF failure",
-    )
-
-    print("[PASS] ToF communication failure")
+    failsafe.evaluate(state)
+    assert_equal(failsafe.reason, "PEDAL_COMMUNICATION_ERROR", "Pedal fault changed")
+    print("[PASS] ToF retired; CARLA and pedal protection preserved")
 
 
 def test_normal_state():
@@ -126,7 +121,7 @@ def test_recovery():
     # Start with fail-safe active
     state.tof_connected = False
     state.pedal_connected = True
-    state.pedal_sensor_status = 0x00
+    state.pedal_sensor_status = 0x04
 
     failsafe.evaluate(state)
 
@@ -160,7 +155,7 @@ def test_recovery():
 def run_all_tests():
     print("=== FailSafeManager Tests ===")
 
-    test_tof_failure()
+    test_tof_not_required()
     test_normal_state()
     test_pedal_sensor_error()
     test_pedal_disconnected_failsafe()
