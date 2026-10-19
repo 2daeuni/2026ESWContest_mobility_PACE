@@ -5,7 +5,7 @@ import time
 
 
 class CarlaControlSender:
-    def __init__(self, host="192.168.50.1", port=5008):
+    def __init__(self, host="192.168.0.57", port=5008):
         self.destination = (host, port)
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setblocking(False)

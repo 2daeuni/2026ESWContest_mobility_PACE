@@ -22,7 +22,7 @@ except ImportError:
 CAN_CHANNEL = "can0"  # Must already be configured for 500000 bit/s.
 PEDAL_ID = 0x100
 PEDAL_TIMEOUT = 0.20
-UDP_DESTINATION = ("192.168.50.1", 5005)
+UDP_DESTINATION = ("192.168.0.57", 5005)
 SEND_PERIOD = 1.0 / 50
 PRINT_PERIOD = 1.0 / 4
 RETRY_PERIOD = 1.0

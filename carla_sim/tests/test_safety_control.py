@@ -60,26 +60,80 @@ class SafetyControlTests(unittest.TestCase):
         with patch.dict(NS, CREEP_ENABLED=False):
             self.assertEqual(creep('D', 0., 0., 0), 0.)
 
-    def test_reverse_and_park_bypass_every_safety_state(self):
-        for gear in ('R', 'P'):
-            for mode, failsafe, last_rx in ((0, False, 1.), (1, False, 1.),
-                    (2, False, 1.), (0, True, 1.), (2, True, None),
-                    (2, False, 0.)):
-                with self.subTest(gear=gear, mode=mode, failsafe=failsafe, last_rx=last_rx):
+
+    def test_reverse_and_park_safety_states(self):
+        for gear in ("R", "P"):
+            for mode, failsafe, last_rx in (
+                (0, False, 1.),
+                (1, False, 1.),
+                (2, False, 1.),
+                (0, True, 1.),
+                (2, True, None),
+                (2, False, 0.),
+            ):
+                with self.subTest(
+                    gear=gear,
+                    mode=mode,
+                    failsafe=failsafe,
+                    last_rx=last_rx,
+                ):
                     self.receiver.mode = mode
                     self.receiver.limit_percent = 30
                     self.receiver.failsafe = failsafe
                     self.receiver.last_rx = last_rx
                     self.receiver.last_log = None
-                    control = SimpleNamespace(throttle=.7, brake=.12, steer=-.4, reverse=True)
+
+                    control = SimpleNamespace(
+                        throttle=.7,
+                        brake=.12,
+                        steer=-.4,
+                        reverse=(gear == "R"),
+                        hand_brake=(gear == "P"),
+                    )
+
+                    self.sock.recvfrom.side_effect = BlockingIOError
+
                     with contextlib.redirect_stdout(self.output):
-                        self.receiver.apply(control, 1., gear=gear)
-                    self.assertEqual((control.throttle, control.brake, control.steer,
-                                      control.reverse), (.7, .12, -.4, True))
-        self.assertIn('GEAR=R', self.output.getvalue())
-        self.assertIn('CREEP=0', self.output.getvalue())
-        self.assertIn('SAFETY_BYPASS_FOR_REVERSE=1', self.output.getvalue())
-        self.assertNotIn('STALE -> STOP', self.output.getvalue())
+                        self.receiver.apply(
+                            control,
+                            1.,
+                            gear=gear,
+                        )
+
+                    stale = last_rx is None or last_rx == 0.
+
+                    if stale or failsafe or mode == 2:
+                        expected_throttle = 0.
+                        expected_brake = 1.
+                    elif gear == "P":
+                        expected_throttle = 0.
+                        expected_brake = 1.
+                    elif mode == 1:
+                        expected_throttle = .3
+                        expected_brake = .12
+                    else:
+                        expected_throttle = .7
+                        expected_brake = .12
+
+                    self.assertAlmostEqual(
+                        control.throttle,
+                        expected_throttle,
+                    )
+                    self.assertEqual(control.brake, expected_brake)
+                    self.assertEqual(control.steer, -.4)
+                    self.assertEqual(control.reverse, gear == "R")
+                    self.assertEqual(control.hand_brake, gear == "P")
+
+        logs = self.output.getvalue()
+        self.assertIn("GEAR=R", logs)
+        self.assertIn("GEAR=P", logs)
+        self.assertIn("SAFETY_ACTIVE_FOR_REVERSE=1", logs)
+        self.assertIn("MODE=LIMIT", logs)
+        self.assertIn("MODE=STOP", logs)
+        self.assertIn("MODE=PARK", logs)
+        self.assertIn("MODE=FAILSAFE_STOP", logs)
+        self.assertIn("STALE -> STOP", logs)
+
 
     def test_main_driver_priority_and_gear_transition(self):
         source = SOURCE.read_text()

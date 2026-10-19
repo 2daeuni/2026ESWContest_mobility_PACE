@@ -54,7 +54,7 @@ class CarlaReceiverV2:
             self.connected = False
             return False
 
-        if address[0] != "192.168.50.1":
+        if address[0] != "192.168.0.57":
             return False
 
         try:

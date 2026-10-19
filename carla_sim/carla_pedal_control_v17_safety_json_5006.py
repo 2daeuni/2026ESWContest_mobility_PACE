@@ -178,7 +178,7 @@ FAILSAFE_TIMEOUT = 0.5
 # closing_speed_mps / ttc_s 를 모두 null 로 송신한다.
 # ============================================================
 
-RPI_IP = "192.168.50.2"
+RPI_IP = "192.168.0.37"
 RPI_TELEMETRY_PORT = 5006
 
 TELEMETRY_SEND_HZ = 10.0
@@ -380,7 +380,7 @@ GEAR_CHANGE_SPEED_KMH = 1.0
 # CONTROL MODE
 # ============================================================
 
-control_mode = "KEYBOARD"
+control_mode = "HARDWARE"
 
 
 # ============================================================
@@ -565,6 +565,105 @@ def find_front_vehicle_for_safety(
     return closest
 
 
+def find_rear_vehicle_for_safety(
+    world,
+    ego_vehicle,
+    max_distance=SAFETY_FRONT_MAX_DISTANCE_M,
+    lateral_limit=SAFETY_FRONT_LATERAL_LIMIT_M,
+):
+    """Find the closest vehicle in the ego-rear corridor."""
+    ego_transform = ego_vehicle.get_transform()
+    ego_location = ego_transform.location
+    ego_forward = ego_transform.get_forward_vector()
+    ego_right = ego_transform.get_right_vector()
+
+    ego_velocity_forward = get_forward_speed_mps(
+        ego_vehicle, ego_forward
+    )
+    ego_rear_extent = max(
+        0.0, float(ego_vehicle.bounding_box.extent.x)
+    )
+
+    closest = None
+
+    for actor in world.get_actors().filter("vehicle.*"):
+        if actor.id == ego_vehicle.id:
+            continue
+
+        try:
+            location = actor.get_location()
+
+            dx = location.x - ego_location.x
+            dy = location.y - ego_location.y
+            dz = location.z - ego_location.z
+
+            longitudinal = (
+                dx * ego_forward.x
+                + dy * ego_forward.y
+                + dz * ego_forward.z
+            )
+            lateral = (
+                dx * ego_right.x
+                + dy * ego_right.y
+                + dz * ego_right.z
+            )
+
+            # Ignore vehicles in front or outside the rear corridor.
+            if longitudinal >= 0.0:
+                continue
+
+            if abs(lateral) > lateral_limit:
+                continue
+
+            target_half_length = max(
+                0.0, float(actor.bounding_box.extent.x)
+            )
+
+            bumper_gap = max(
+                0.0,
+                -longitudinal
+                - ego_rear_extent
+                - target_half_length,
+            )
+
+            if bumper_gap > max_distance:
+                continue
+
+            target_velocity_forward = get_forward_speed_mps(
+                actor, ego_forward
+            )
+
+            # Positive when the rear gap is closing.
+            closing_speed = (
+                target_velocity_forward
+                - ego_velocity_forward
+            )
+
+            ttc = (
+                bumper_gap / closing_speed
+                if closing_speed > 0.0
+                else None
+            )
+
+            candidate = {
+                "actor": actor,
+                "distance_m": float(bumper_gap),
+                "closing_speed_mps": float(closing_speed),
+                "ttc_s": float(ttc) if ttc is not None else None,
+            }
+
+            if (
+                closest is None
+                or candidate["distance_m"] < closest["distance_m"]
+            ):
+                closest = candidate
+
+        except RuntimeError:
+            continue
+
+    return closest
+
+
 def build_safety_telemetry(
     world,
     ego_vehicle,
@@ -572,6 +671,7 @@ def build_safety_telemetry(
     virtual_obstacle_active,
     virtual_obstacle_distance,
     virtual_obstacle_materialized=False,
+    gear="D",
 ):
     """Create the exact JSON object expected by Pi Safety ECU."""
     vehicle_speed_kmh = max(
@@ -588,7 +688,8 @@ def build_safety_telemetry(
     # After handoff, use current actor detection, including an absent obstacle.
     # A consumed zero-distance preview must never remain latched after collision.
     if (
-        virtual_obstacle_active
+        gear == "D"
+        and virtual_obstacle_active
         and virtual_obstacle_distance is not None
         and virtual_obstacle_distance > 0.0
         and not virtual_obstacle_materialized
@@ -622,23 +723,29 @@ def build_safety_telemetry(
                 / closing_speed_mps
             )
 
-    else:
-        front_vehicle = find_front_vehicle_for_safety(
-            world,
-            ego_vehicle,
-        )
 
-        if front_vehicle is not None:
-            obstacle_id = int(
-                front_vehicle["actor"].id
+    else:
+        detected_vehicle = None
+
+        if gear == "D":
+            detected_vehicle = find_front_vehicle_for_safety(
+                world,
+                ego_vehicle,
             )
-            distance_m = float(
-                front_vehicle["distance_m"]
+        elif gear == "R":
+            detected_vehicle = find_rear_vehicle_for_safety(
+                world,
+                ego_vehicle,
             )
+
+        if detected_vehicle is not None:
+            obstacle_id = int(detected_vehicle["actor"].id)
+            distance_m = float(detected_vehicle["distance_m"])
             closing_speed_mps = float(
-                front_vehicle["closing_speed_mps"]
+                detected_vehicle["closing_speed_mps"]
             )
-            ttc_s = front_vehicle["ttc_s"]
+            ttc_s = detected_vehicle["ttc_s"]
+
 
     return {
         "source": "CARLA",
@@ -2598,7 +2705,7 @@ class LaneFFBSender:
 
 
 class SafetyControlReceiver:
-    """Apply final Safety commands only in D; keep receiving in every gear."""
+    """Apply Safety commands in D/R and maintain fail-safe in every gear."""
     def __init__(self, host="0.0.0.0", port=5008, timeout=0.5):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -2650,25 +2757,37 @@ class SafetyControlReceiver:
         raw_throttle = control.throttle
         raw_brake = control.brake
         fresh = self.last_rx is not None and 0 <= now - self.last_rx < self.timeout
-        # Final priority: stale > failsafe > STOP > LIMIT > NORMAL.
-        if gear != "D":
-            applied_mode = "BYPASS"
-        elif not fresh or self.failsafe or self.mode == 2:
+
+        # Priority: stale/failsafe > STOP > PARK > LIMIT > NORMAL.
+        if not fresh or self.failsafe:
+            control.throttle = 0.0
+            control.brake = 1.0
+            applied_mode = "FAILSAFE_STOP"
+        elif gear == "P":
+            control.throttle = 0.0
+            control.brake = 1.0
+            control.hand_brake = True
+            applied_mode = "PARK"
+        elif self.mode == 2:
             control.throttle = 0.0
             control.brake = 1.0
             applied_mode = "STOP"
         elif self.mode == 1:
-            control.throttle = min(raw_throttle, self.limit_percent / 100.0)
+            control.throttle = min(
+                raw_throttle,
+                self.limit_percent / 100.0,
+            )
             applied_mode = "LIMIT"
         else:
             applied_mode = "NORMAL"
+
         if self.last_log is None or now - self.last_log >= 0.5:
             self.last_log = now
             print(
                 f"[CARLA SAFETY] GEAR={gear} SPEED_KMH={speed_kmh:.1f} "
                 f"CREEP={int(creep_throttle > 0.0)} "
                 f"CREEP_THROTTLE={creep_throttle:.3f} "
-                f"SAFETY_BYPASS_FOR_REVERSE={int(gear == 'R')} "
+                f"SAFETY_ACTIVE_FOR_REVERSE={int(gear == 'R')} "
                 f"RISK=L{self.risk_level} MODE={applied_mode} "
                 f"LIMIT={self.limit_percent:g} FAILSAFE={int(self.failsafe)} "
                 f"FRESH={int(fresh)} "
@@ -2676,7 +2795,7 @@ class SafetyControlReceiver:
                 f"RAW_BRAKE={raw_brake:.2f} APPLIED_THROTTLE={control.throttle:.3f} "
                 f"APPLIED_BRAKE={control.brake:.2f}"
             )
-            if not fresh and gear == "D":
+            if not fresh:
                 if self.last_rx is None:
                     print("[CARLA SAFETY] WAITING FOR FIRST safety_control PACKET -> STOP")
                 print("[CARLA SAFETY] STALE -> STOP")
@@ -4151,6 +4270,7 @@ def main():
                     virtual_obstacle_active,
                     virtual_obstacle_distance,
                     virtual_obstacle_materialized=(night_obstacle is not None),
+                    gear=applied_gear,
                 )
 
                 telemetry_message = json.dumps(

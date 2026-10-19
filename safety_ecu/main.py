@@ -55,7 +55,7 @@ def main():
 
     if INPUT_MODE == INPUT_MODE_CARLA:
         carla_receiver = CarlaReceiverV2(
-            host="192.168.50.2",
+            host="192.168.0.37",
             port=5006,
             timeout=0.5,
         )
