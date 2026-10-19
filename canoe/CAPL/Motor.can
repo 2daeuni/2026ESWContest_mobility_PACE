@@ -1,0 +1,240 @@
+﻿/*@!Encoding:65001*/
+// Motor ECU simulation node
+// Rx: PEDAL_STATUS (0x100), MOTOR_COMMAND (0x120)
+// Tx: MOTOR_STATUS (0x210), 10 ms
+
+includes
+{
+}
+
+variables
+{
+  const int PACE_CYCLE_MS   = 10;   // all messages are 10 ms cyclic
+  const int PACE_TIMEOUT_MS = 50;   // common reception timeout (5 cycles)
+
+  const int CTRL_NORMAL = 0;
+  const int CTRL_LIMIT  = 1;
+  const int CTRL_STOP   = 2;
+
+  const int ST_STOP    = 0;
+  const int ST_RUNNING = 1;
+  const int ST_LIMITED = 2;
+  const int ST_FAULT   = 3;
+
+  // Longitudinal speed model (assumption A8): PWM = drive force -> acceleration
+  // Holding the pedal keeps increasing the speed up to the vehicle top speed
+  const float VMAX_KMH   = 180.0;  // vehicle top speed [km/h]
+  const float A_DRIVE    = 4.0;    // acceleration at 100 % PWM from standstill [m/s^2]
+  const float DECEL_ROLL = 1.0;    // rolling resistance when coasting (PWM 0) [m/s^2]
+  // Braking model (assumption R7): no brake message in the spec, stop = motor braking
+  const float DECEL_ESTOP     = 8.0;   // EStop deceleration [m/s^2]
+  const float DECEL_STOP      = 5.0;   // Motor Stop / fault deceleration [m/s^2]
+  const long  BRAKE_OVERRIDE_PCT = 10;   // brake override threshold [%]
+  const float DECEL_BRAKE_MAX = 8.0;   // driver brake at 100 % [m/s^2]
+
+  message MOTOR_STATUS mSts;
+  msTimer tCycle;
+
+  byte  aliveCnt;
+  byte  appliedCnt;
+  float lastPedalRx;
+  float lastCmdRx;
+
+  long  accel;
+  long  brake;
+  int   accelErr;
+
+  long  cmdMode;
+  long  cmdLimit;
+  long  cmdEStop;
+
+  float speed;
+}
+
+on start
+{
+  float t;
+  t = nowMs();
+  lastPedalRx = t;
+  lastCmdRx   = t;
+  aliveCnt    = 0;
+  appliedCnt  = 0;
+  accel       = 0;
+  brake       = 0;
+  accelErr    = 0;
+  cmdMode     = CTRL_NORMAL;
+  cmdLimit    = 100;
+  cmdEStop    = 0;
+  speed       = 0;
+  setTimer(tCycle, PACE_CYCLE_MS);
+}
+
+// Simulation reset (Panel reset button): vehicle stopped
+on sysvar_update Safety::ObstacleReset
+{
+  if (@Safety::ObstacleReset != 1) return;
+  speed = 0;
+  @Motor::ModelSpeed = 0;
+}
+
+on message PEDAL_STATUS
+{
+  if (this.dir != RX) return;
+  lastPedalRx = nowMs();
+  accel = this.Pdl_AccelPedal;
+  brake = this.Pdl_BrakePedal;
+  accelErr = (this.Pdl_Err_AccelAdcRange == 1) || (this.Pdl_Err_AccelDisconnect == 1) || (this.Pdl_Err_AccelCalib == 1);
+}
+
+on message MOTOR_COMMAND
+{
+  if (this.dir != RX) return;
+  // CommandValid = 0: ignore, keep the last valid command, do not refresh the timeout (A4)
+  if (this.MotCmd_CmdValid != 1) return;
+
+  lastCmdRx  = nowMs();
+  cmdMode    = this.MotCmd_ControlMode;
+  cmdLimit   = this.MotCmd_OutputLimit;
+  cmdEStop   = this.MotCmd_EStop;
+  appliedCnt = this.MotCmd_AliveCnt;
+}
+
+on timer tCycle
+{
+  float tNow;
+  int   pedalTo;
+  int   cmdTo;
+  int   driverFault;
+  long  normalPwm;
+  long  finalPwm;
+  long  appliedLimit;
+  long  state;
+  long  speedRaw;
+  float dt;
+  float vmax;
+  float accMps2;
+
+  setTimer(tCycle, PACE_CYCLE_MS);
+  tNow = nowMs();
+
+  pedalTo     = (tNow - lastPedalRx) >= PACE_TIMEOUT_MS;
+  cmdTo       = (tNow - lastCmdRx)   >= PACE_TIMEOUT_MS;
+  driverFault = (@Motor::DriverFaultInject == 1);
+
+  // Normal PWM = accelerator pedal 1:1 (A7); pedal loss or accel sensor fault -> 0 (A3, A5)
+  normalPwm = clampL(accel, 0, 100);
+  if (pedalTo || accelErr) normalPwm = 0;
+  // Brake override: brake pedal pressed (>= 10 %) -> drive output 0 (simulation vehicle model)
+  if (brake >= BRAKE_OVERRIDE_PCT) normalPwm = 0;
+
+  // Command application; command loss or EStop -> stop (A3, A4)
+  if (cmdTo || (cmdEStop == 1) || (cmdMode == CTRL_STOP))
+  {
+    finalPwm     = 0;
+    appliedLimit = 0;
+  }
+  else if (cmdMode == CTRL_LIMIT)
+  {
+    appliedLimit = cmdLimit;
+    finalPwm     = minL(normalPwm, cmdLimit);
+  }
+  else
+  {
+    appliedLimit = 0;            // Normal mode: no limit applied -> reported as 0
+    finalPwm     = normalPwm;
+  }
+  if (driverFault) finalPwm = 0;
+
+  // Motor state
+  if (driverFault || pedalTo || cmdTo)        state = ST_FAULT;
+  else if (finalPwm == 0)                     state = ST_STOP;
+  else if (cmdMode == CTRL_LIMIT)             state = ST_LIMITED;
+  else                                        state = ST_RUNNING;
+
+  // Vehicle speed model
+  dt = PACE_CYCLE_MS / 1000.0;
+  if (cmdEStop == 1)
+    speed = speed - DECEL_ESTOP * dt;                      // emergency braking
+  else if (cmdTo || pedalTo || driverFault || (cmdMode == CTRL_STOP))
+    speed = speed - DECEL_STOP * dt;                       // controlled stop
+  else
+  {
+    vmax  = VMAX_KMH / 3.6;
+    accMps2 = (finalPwm / 100.0) * A_DRIVE - A_DRIVE * (speed / vmax) * (speed / vmax);   // drive - air drag
+    if (finalPwm == 0) accMps2 = accMps2 - DECEL_ROLL;                                     // coasting
+    speed = speed + accMps2 * dt;
+  }
+  speed = speed - (clampL(brake, 0, 100) / 100.0) * DECEL_BRAKE_MAX * dt;  // driver brake
+  if (speed < 0) speed = 0;
+  // Simulation only: after a collision the vehicle stays stopped until RESET
+  if (@Safety::Collision == 1) speed = 0;
+  if ((finalPwm == 0) && (speed < 0.005)) speed = 0;
+  @Motor::ModelSpeed = speed;
+
+  if (@Motor::SpeedInvalidInject == 1)
+    speedRaw = 0xFFFF;                         // speed not measurable
+  else if (@Motor::SpeedOvrEn == 1)
+    speedRaw = speedToRaw(@Motor::SpeedOvr);   // test hook
+  else
+    speedRaw = speedToRaw(speed);
+
+  // Display value in km/h for the Panel (same value as MotSts_VehicleSpeed, works without Safety node)
+  if (speedRaw == 0xFFFF) @Motor::VehicleSpeedKmh = 0;
+  else                    @Motor::VehicleSpeedKmh = speedRaw * 0.01 * 3.6;
+
+  // CARLA mode without Motor ECU: MOTOR_STATUS is not transmitted
+  if (@Motor::TxStop == 1) return;
+
+  mSts.MotSts_ActualPWM         = finalPwm;
+  mSts.MotSts_AppliedLimit      = appliedLimit;
+  mSts.MotSts_VehicleSpeed  = speedRaw;
+  mSts.MotSts_MotorState        = state;
+  mSts.MotSts_DriverFault       = driverFault;
+  mSts.MotSts_PedalTimeout      = pedalTo;
+  mSts.MotSts_CmdTimeout        = cmdTo;
+  mSts.MotSts_EStopActive       = cmdEStop;
+  mSts.MotSts_AppliedCmdCnt     = appliedCnt;
+  mSts.MotSts_AliveCnt          = aliveCnt;
+  output(mSts);
+  aliveCnt = nextCnt(aliveCnt);
+}
+
+// m/s -> raw (0.01 m/s per bit); 0xFFFF is reserved for invalid
+long speedToRaw(float mps)
+{
+  return clampL(roundL(mps / 0.01), 0, 0xFFFE);
+}
+
+// ---- Common helpers ----
+// Current measurement time in milliseconds (timeNow() is in 10 us units)
+float nowMs()
+{
+  return timeNow() / 100.0;
+}
+
+// Round half away from zero
+long roundL(float x)
+{
+  if (x >= 0) return (long)(x + 0.5);
+  return (long)(x - 0.5);
+}
+
+long clampL(long x, long lo, long hi)
+{
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+long minL(long a, long b)
+{
+  if (a < b) return a;
+  return b;
+}
+
+// Alive counter: 0 -> 255 -> 0
+byte nextCnt(byte cnt)
+{
+  if (cnt >= 255) return 0;
+  return cnt + 1;
+}

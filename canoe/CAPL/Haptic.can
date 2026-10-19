@@ -1,0 +1,167 @@
+﻿/*@!Encoding:65001*/
+// Haptic ECU simulation node
+// Rx: HAPTIC_COMMAND (0x110)
+// Tx: HAPTIC_STATUS (0x200), 10 ms
+
+includes
+{
+}
+
+variables
+{
+  const int PACE_CYCLE_MS   = 10;   // all messages are 10 ms cyclic
+  const int PACE_TIMEOUT_MS = 50;   // common reception timeout (5 cycles)
+
+  message HAPTIC_STATUS mSts;
+  msTimer tCycle;
+
+  byte  aliveCnt;
+  float lastCmdRx;
+
+  long  curRisk;
+  long  vibOn;
+  long  intensity;
+  long  frequency;
+  int   invalidCmd;
+}
+
+on start
+{
+  aliveCnt   = 0;
+  lastCmdRx  = nowMs();
+  curRisk    = 0;
+  vibOn      = 0;
+  intensity  = 0;
+  frequency  = 0;
+  invalidCmd = 0;
+  setTimer(tCycle, PACE_CYCLE_MS);
+}
+
+on message HAPTIC_COMMAND
+{
+  long r;
+  long c;
+  long i;
+  long f;
+
+  if (this.dir != RX) return;
+  lastCmdRx = nowMs();   // any received frame refreshes the 50 ms timeout
+
+  r = this.HapCmd_RiskLevel;
+  c = this.HapCmd_VibCmd;
+  i = this.HapCmd_Intensity;
+  f = this.HapCmd_Frequency;
+
+  if (!isValidCommand(r, c, i, f))
+  {
+    invalidCmd = 1;   // keep the last applied state, report INVALID_COMMAND
+    return;
+  }
+
+  invalidCmd = 0;
+  curRisk = r;
+  if (c == 1)
+  {
+    vibOn     = 1;
+    intensity = i;
+    frequency = f;
+  }
+  else
+  {
+    // VibCmd = 0 -> OFF regardless of the other fields
+    vibOn     = 0;
+    intensity = 0;
+    frequency = 0;
+  }
+}
+
+int isValidCommand(long r, long c, long i, long f)
+{
+  if (r > 3) return 0;
+  if (c > 1) return 0;
+  if (c == 1)
+  {
+    if (i > 100) return 0;
+    if ((f < 10) || (f > 50)) return 0;
+  }
+  return 1;
+}
+
+on timer tCycle
+{
+  int  cmdTimeout;
+  long fault;
+  long outOn;
+  long outI;
+  long outF;
+
+  setTimer(tCycle, PACE_CYCLE_MS);
+
+  cmdTimeout = (nowMs() - lastCmdRx) >= PACE_TIMEOUT_MS;
+
+  fault = clampL(@Haptic::FaultInject, 0, 4);
+  if ((fault == 0) && invalidCmd) fault = 3;   // INVALID_COMMAND
+
+  outOn = vibOn;
+  outI  = intensity;
+  outF  = frequency;
+
+  // Command timeout or actuator/driver fault -> vibration OFF
+  if (cmdTimeout || (fault == 1) || (fault == 2))
+  {
+    outOn = 0;
+    outI  = 0;
+    outF  = 0;
+  }
+
+  @Haptic::VibOutput = outOn;   // panel LED
+
+  if (@Haptic::TxStop == 1) return;
+
+  mSts.HapSts_RiskLevel     = curRisk;
+  mSts.HapSts_VibStatus     = outOn;
+  mSts.HapSts_Intensity     = outI;
+  mSts.HapSts_Frequency     = outF;
+  mSts.HapSts_FaultCode     = fault;
+  mSts.HapSts_CmdTimeout    = cmdTimeout;
+  // ECU Status: 1 = normal, 0 = error (any fault code set)
+  if (fault == 0) mSts.HapSts_EcuStatus = 1;
+  else            mSts.HapSts_EcuStatus = 0;
+  mSts.HapSts_AliveCnt      = aliveCnt;
+  output(mSts);
+  aliveCnt = nextCnt(aliveCnt);
+}
+
+// ---- Common helpers ----
+// Current measurement time in milliseconds (timeNow() is in 10 us units)
+float nowMs()
+{
+  return timeNow() / 100.0;
+}
+
+// Round half away from zero
+long roundL(float x)
+{
+  if (x >= 0) return (long)(x + 0.5);
+  return (long)(x - 0.5);
+}
+
+long clampL(long x, long lo, long hi)
+{
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+long minL(long a, long b)
+{
+  if (a < b) return a;
+  return b;
+}
+
+// Alive counter: 0 -> 255 -> 0
+byte nextCnt(byte cnt)
+{
+  if (cnt >= 255) return 0;
+  return cnt + 1;
+}
