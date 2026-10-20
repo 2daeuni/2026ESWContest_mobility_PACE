@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import socket
 import textwrap
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -15,10 +16,41 @@ from safety_ecu.control.command_mapper import CommandMapper
 
 SOURCE = Path(__file__).resolve().parents[1] / 'carla_pedal_control_v17_safety_json_5006.py'
 TREE = ast.parse(SOURCE.read_text())
-NS = {'socket': socket, 'json': json}
+NS = {'socket': socket, 'json': json, 'time': time}
 exec(compile(ast.Module(body=[n for n in TREE.body if isinstance(n, ast.ClassDef)
      and n.name == 'SafetyControlReceiver'], type_ignores=[]), str(SOURCE), 'exec'), NS)
 
+RADAR_CLASS = next(
+    node for node in TREE.body
+    if isinstance(node, ast.ClassDef)
+    and node.name == "FrontDistanceSensor"
+)
+
+exec(
+    compile(
+        ast.Module(body=[RADAR_CLASS], type_ignores=[]),
+        str(SOURCE),
+        "exec"
+    ),
+    NS
+)
+
+import math
+
+TELEMETRY_FUNCTION = next(
+    node for node in TREE.body
+    if isinstance(node, ast.FunctionDef)
+    and node.name == "build_safety_telemetry"
+)
+
+exec(
+    compile(
+        ast.Module(body=[TELEMETRY_FUNCTION], type_ignores=[]),
+        str(SOURCE),
+        "exec",
+    ),
+    NS,
+)
 
 CREEP_NODES = [n for n in TREE.body if (
     isinstance(n, ast.Assign) and any(
@@ -29,17 +61,392 @@ exec(compile(ast.Module(body=CREEP_NODES, type_ignores=[]), str(SOURCE), 'exec')
 
 
 class SafetyControlTests(unittest.TestCase):
+    def test_radar_safety_distance_freshness(self):
+        sensor = NS["FrontDistanceSensor"].__new__(
+            NS["FrontDistanceSensor"]
+        )
+
+        sensor.distance = 5.0
+        sensor.last_valid_time = 9.9
+        sensor.collision_zero_until = 0.0
+
+        # Fresh Radar measurement
+        with patch.object(time, "monotonic", return_value=10.0):
+            self.assertEqual(sensor.get_safety_distance(), 5.0)
+
+        # Stale Radar measurement
+        with patch.object(time, "monotonic", return_value=10.2):
+            self.assertIsNone(sensor.get_safety_distance())
+
+        # Recent collision takes priority
+        sensor.collision_zero_until = 10.5
+
+        with patch.object(time, "monotonic", return_value=10.3):
+            self.assertEqual(sensor.get_safety_distance(), 0.0)
+
+        # No valid measurement
+        sensor.collision_zero_until = 0.0
+        sensor.last_valid_time = 0.0
+
+        with patch.object(time, "monotonic", return_value=10.4):
+            self.assertIsNone(sensor.get_safety_distance())
+
+    def test_radar_safety_corridor_filter(self):
+        import math
+        import time
+        import weakref
+
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        sensor_class = NS["FrontDistanceSensor"]
+
+        sensor = sensor_class.__new__(sensor_class)
+        sensor.distance = None
+        sensor.distance_history = []
+        sensor.last_valid_time = 0.0
+        sensor.collision_zero_until = 0.0
+        sensor.safety_corridor_distance = None
+        sensor.last_safety_valid_time = 0.0
+
+        def detection(depth, azimuth_deg=0.0, altitude_deg=0.0):
+            return SimpleNamespace(
+                depth=depth,
+                azimuth=math.radians(azimuth_deg),
+                altitude=math.radians(altitude_deg),
+            )
+
+        def median_value(values):
+            ordered = sorted(values)
+            middle = len(ordered) // 2
+            if len(ordered) % 2:
+                return ordered[middle]
+            return (ordered[middle - 1] + ordered[middle]) / 2
+
+        test_globals = {
+            "math": math,
+            "median": median_value,
+            "clamp": lambda x, low, high: max(low, min(high, x)),
+            "FRONT_DISTANCE_RANGE": 50.0,
+            "SAFETY_RADAR_AZIMUTH_DEG": 4.0,
+            "SAFETY_RADAR_ALTITUDE_DEG": 3.0,
+            "SAFETY_RADAR_MIN_POINTS": 3,
+            "SAFETY_RADAR_FRESHNESS_S": 0.2,
+            "DISTANCE_CLOSEST_POINT_COUNT": 5,
+            "DISTANCE_HISTORY_SIZE": 7,
+            "DISTANCE_DISPLAY_STEP": 0.05,
+            "DISTANCE_DEADBAND": 0.08,
+            "DISTANCE_NO_SIGN_DELAY": 0.25,
+        }
+
+        weak_sensor = weakref.ref(sensor)
+
+        with patch.dict(NS, test_globals):
+
+            # 1. 정면에 유효한 반사점 3개
+            with patch.object(time, "monotonic", return_value=10.0):
+                sensor_class._on_radar(
+                    weak_sensor,
+                    [
+                        detection(5.0),
+                        detection(5.1, 1.0),
+                        detection(5.2, -1.0),
+                    ],
+                )
+                self.assertAlmostEqual(
+                    sensor.get_safety_corridor_distance(), 5.1
+                )
+
+            # 2. 좌우 범위를 벗어난 반사점
+            with patch.object(time, "monotonic", return_value=10.1):
+                sensor_class._on_radar(
+                    weak_sensor,
+                    [
+                        detection(4.0, 8.0),
+                        detection(4.1, 9.0),
+                        detection(4.2, -8.0),
+                    ],
+                )
+                self.assertIsNone(
+                    sensor.get_safety_corridor_distance()
+                )
+
+            # 3. 우상하 범위를 벗어난 반사점
+            with patch.object(time, "monotonic", return_value=10.2):
+                sensor_class._on_radar(
+                    weak_sensor,
+                    [
+                        detection(4.0, 0.0, 6.0),
+                        detection(4.1, 0.0, 7.0),
+                        detection(4.2, 0.0, -6.0),
+                    ],
+                )
+                self.assertIsNone(
+                    sensor.get_safety_corridor_distance()
+                )
+
+            # 4. 유효 반사점이 2개뿐인 경우
+            with patch.object(time, "monotonic", return_value=10.3):
+                sensor_class._on_radar(
+                    weak_sensor,
+                    [detection(3.0), detection(3.1)],
+                )
+                self.assertIsNone(
+                    sensor.get_safety_corridor_distance()
+                )
+
+            # 5. 정상 측정 후 오래된 값 차단
+            with patch.object(time, "monotonic", return_value=10.4):
+                sensor_class._on_radar(
+                    weak_sensor,
+                    [
+                        detection(6.0),
+                        detection(6.1),
+                        detection(6.2),
+                    ],
+                )
+                self.assertAlmostEqual(
+                    sensor.get_safety_corridor_distance(), 6.1
+                )
+
+            with patch.object(time, "monotonic", return_value=10.7):
+                self.assertIsNone(
+                    sensor.get_safety_corridor_distance()
+                )
+
+            # 6. 새 프로엠에 반사점이 없는 경우
+            with patch.object(time, "monotonic", return_value=10.8):
+                sensor_class._on_radar(weak_sensor, [])
+                self.assertIsNone(
+                    sensor.get_safety_corridor_distance()
+                )
+
+    def test_radar_telemetry_integration(self):
+        build = NS["build_safety_telemetry"]
+
+        ego = SimpleNamespace(
+            get_transform=lambda: SimpleNamespace(
+                get_forward_vector=lambda: SimpleNamespace(
+                    x=1.0, y=0.0, z=0.0
+                )
+            )
+        )
+
+        world = object()
+        actor = SimpleNamespace(id=1234)
+
+        front_vehicle = {
+            "actor": actor,
+            "distance_m": 12.0,
+            "closing_speed_mps": 4.0,
+            "ttc_s": 3.0,
+        }
+
+        rear_vehicle = {
+            "actor": actor,
+            "distance_m": 8.0,
+            "closing_speed_mps": 2.0,
+            "ttc_s": 4.0,
+        }
+
+        def run_case(
+            gear="D",
+            radar_distance=None,
+            front=None,
+            rear=None,
+            speed_mps=10.0,
+            virtual_active=False,
+            virtual_distance=None,
+            materialized=False,
+        ):
+            sensor = SimpleNamespace(
+                get_safety_corridor_distance=lambda: radar_distance
+            )
+
+            globals_for_test = {
+                "math": math,
+                "FRONT_DISTANCE_RANGE": 50.0,
+                "RADAR_OBSTACLE_ID": 900002,
+                "NIGHT_SCENARIO_OBSTACLE_ID": 900001,
+                "get_speed_kmh": lambda vehicle: abs(speed_mps) * 3.6,
+                "get_forward_speed_mps": (
+                    lambda vehicle, direction: speed_mps
+                ),
+                "find_front_vehicle_for_safety": (
+                    lambda world, vehicle: front
+                ),
+                "find_rear_vehicle_for_safety": (
+                    lambda world, vehicle: rear
+                ),
+            }
+
+            with patch.dict(NS, globals_for_test):
+                return build(
+                    world,
+                    ego,
+                    7,
+                    virtual_active,
+                    virtual_distance,
+                    virtual_obstacle_materialized=materialized,
+                    gear=gear,
+                    front_distance_sensor=sensor,
+                )
+
+        # 1. 자동차가 없으면 Radar 장애물 사용
+        result = run_case(radar_distance=5.0)
+        self.assertEqual(result["obstacle_id"], 900002)
+        self.assertEqual(result["distance_m"], 5.0)
+        self.assertEqual(result["closing_speed_mps"], 10.0)
+        self.assertEqual(result["ttc_s"], 0.5)
+
+        # 2. 자동차가 있으면 기존 Actor 우선
+        result = run_case(radar_distance=5.0, front=front_vehicle)
+        self.assertEqual(result["obstacle_id"], 1234)
+        self.assertEqual(result["distance_m"], 12.0)
+        self.assertEqual(result["ttc_s"], 3.0)
+
+        # 3. 자동차와 Radar 모두 없을 때
+        result = run_case()
+        for key in (
+            "obstacle_id",
+            "distance_m",
+            "closing_speed_mps",
+            "ttc_s",
+        ):
+            self.assertIsNone(result[key])
+
+        # 4. 후진에서는 후방 자동차만 선택
+        result = run_case(
+            gear="R",
+            radar_distance=5.0,
+            rear=rear_vehicle,
+        )
+        self.assertEqual(result["obstacle_id"], 1234)
+        self.assertEqual(result["distance_m"], 8.0)
+
+        # 5. 주차 상태에서는 장애물 선택 안 함
+        result = run_case(gear="P", radar_distance=5.0)
+        self.assertIsNone(result["obstacle_id"])
+
+        # 6. O키 가상 장애물 시나리오 우선
+        result = run_case(
+            radar_distance=5.0,
+            front=front_vehicle,
+            virtual_active=True,
+            virtual_distance=30.0,
+        )
+        self.assertEqual(result["obstacle_id"], 900001)
+        self.assertEqual(result["distance_m"], 30.0)
+        self.assertEqual(result["ttc_s"], 3.0)
+
+        # 7. 정지 상태에서는 TTC 없음
+        result = run_case(radar_distance=5.0, speed_mps=0.0)
+        self.assertEqual(result["closing_speed_mps"], 0.0)
+        self.assertIsNone(result["ttc_s"])
+
+        # 8. 유효하지 않은 Radar 거리 제외
+        for bad_distance in (
+            float("nan"),
+            float("inf"),
+            -1.0,
+            51.0,
+        ):
+            with self.subTest(radar_distance=bad_distance):
+                result = run_case(radar_distance=bad_distance)
+                self.assertIsNone(result["obstacle_id"])
+
+        # 9. 가상 장애물이 실제 Actor로 전환된 뒤
+        result = run_case(
+            radar_distance=5.0,
+            front=front_vehicle,
+            virtual_active=True,
+            virtual_distance=30.0,
+            materialized=True,
+        )
+        self.assertEqual(result["obstacle_id"], 1234)
+
+
+
     def setUp(self):
         self.sock = Mock()
         self.sock.recvfrom.side_effect = BlockingIOError
+
         with patch.object(socket, 'socket', return_value=self.sock):
             self.receiver = NS['SafetyControlReceiver']()
+
         self.output = io.StringIO()
+        self.test_sequence = 0
+        self.test_session_id = "a" * 32
+        self.receiver.allowed_sender_ip = "192.168.0.37"
+
+    def test_old_normal_cannot_override_stop(self):
+        session = "a" * 32
+
+        def send_packet(sequence, mode, now):
+            packet = {
+                "type": "safety_control",
+                "session_id": session,
+                "sequence": sequence,
+                "mode": mode,
+                "limit_percent": 0 if mode == 2 else 100,
+                "risk_level": 3 if mode == 2 else 0,
+                "failsafe": False,
+            }
+
+            self.sock.recvfrom.side_effect = [
+                (
+                    json.dumps(packet).encode(),
+                    ("192.168.0.37", 5008)
+                ),
+                BlockingIOError
+            ]
+
+            self.receiver.receive(now)
+
+        # Accept STOP sequence 100
+        send_packet(100, 2, 1.0)
+
+        self.assertEqual(self.receiver.mode, 2)
+        self.assertEqual(self.receiver.last_sequence, 100)
+
+        # Reject old NORMAL sequence 99
+        send_packet(99, 0, 1.1)
+
+        self.assertEqual(self.receiver.mode, 2)
+        self.assertEqual(self.receiver.last_sequence, 100)
+        self.assertEqual(self.receiver.last_rx, 1.0)
+
+        # Reject duplicate sequence 100
+        send_packet(100, 0, 1.2)
+
+        self.assertEqual(self.receiver.mode, 2)
+        self.assertEqual(self.receiver.last_rx, 1.0)
+
+        # Accept genuinely newer NORMAL sequence 101
+        send_packet(101, 0, 1.3)
+
+        self.assertEqual(self.receiver.mode, 0)
+        self.assertEqual(self.receiver.last_sequence, 101)
+        self.assertEqual(self.receiver.last_rx, 1.3)
 
     def apply_packet(self, mode, limit, throttle, risk=0, now=1., failsafe=False):
-        packet = dict(type='safety_control', sequence=123, mode=mode,
-                      limit_percent=limit, risk_level=risk, failsafe=failsafe)
-        self.sock.recvfrom.side_effect = [(json.dumps(packet).encode(), ('pi', 5008)), BlockingIOError]
+        self.test_sequence += 1
+
+        packet = dict(
+            type='safety_control',
+            session_id=self.test_session_id,
+            sequence=self.test_sequence,
+            mode=mode,
+            limit_percent=limit,
+            risk_level=risk,
+            failsafe=failsafe
+        )
+
+        self.sock.recvfrom.side_effect = [
+            (json.dumps(packet).encode(), ('192.168.0.37', 5008)),
+            BlockingIOError
+        ]
+
         control = SimpleNamespace(throttle=throttle, brake=.37, steer=-.42)
         with contextlib.redirect_stdout(self.output):
             self.receiver.apply(control, now)
@@ -234,10 +641,22 @@ class SafetyControlTests(unittest.TestCase):
         self.assertEqual(self.apply_packet(0, 100, .7, now=1.6), .7)
 
     def test_latest_valid_packet_and_log_values(self):
-        packets = [dict(type='safety_control', sequence=i, mode=mode,
-                        limit_percent=limit, risk_level=risk, failsafe=False)
-                   for i, mode, limit, risk in ((1, 2, 0, 3), (2, 1, 30, 2))]
-        self.sock.recvfrom.side_effect = [(json.dumps(p).encode(), ('pi', 5008))
+        packets = [
+            dict(
+                type='safety_control',
+                session_id="a" * 32,
+                sequence=i,
+                mode=mode,
+                limit_percent=limit,
+                risk_level=risk,
+                failsafe=False
+            )
+            for i, mode, limit, risk in (
+                (1, 2, 0, 3),
+                (2, 1, 30, 2)
+            )
+        ]
+        self.sock.recvfrom.side_effect = [(json.dumps(p).encode(), ('192.168.0.37', 5008))
                                         for p in packets] + [BlockingIOError]
         control = SimpleNamespace(throttle=1., brake=.2, steer=.4)
         with contextlib.redirect_stdout(self.output):
@@ -255,7 +674,7 @@ class SafetyControlTests(unittest.TestCase):
     def test_bad_packets_do_not_refresh(self):
         for data in [b'{', b'[]', b'{}', b'\xff', json.dumps(dict(type='safety_control',
                 sequence=0, mode=1, limit_percent=float('nan'), risk_level=3, failsafe=False)).encode()]:
-            self.sock.recvfrom.side_effect = [(data, ('pi', 5008)), BlockingIOError]
+            self.sock.recvfrom.side_effect = [(data, ('192.168.0.37', 5008)), BlockingIOError]
             self.receiver.receive(1.)
             self.assertIsNone(self.receiver.last_rx)
 
@@ -274,9 +693,17 @@ class SafetyControlTests(unittest.TestCase):
         sender.send(motor, 3, False, now=1.01)
         self.assertEqual(tx.sendto.call_count, 1)
         data, dest = tx.sendto.call_args.args
-        self.assertEqual(dest, ('192.168.50.1', 5008))
-        self.assertEqual(json.loads(data), dict(type='safety_control', sequence=0,
-                         mode=1, limit_percent=30, risk_level=3, failsafe=False))
+        self.assertEqual(dest, ('192.168.0.57', 5008))
+
+        packet = json.loads(data)
+
+        self.assertEqual(packet["type"], "safety_control")
+        self.assertEqual(packet["sequence"], 0)
+        self.assertEqual(packet["session_id"], sender.session_id)
+        self.assertEqual(packet["mode"], 2)
+        self.assertEqual(packet["limit_percent"], 0)
+        self.assertEqual(packet["risk_level"], 3)
+        self.assertTrue(packet["failsafe"])
         sender.send(dict(control_mode=2, output_limit=0), 3, True, now=1.06)
         self.assertEqual(json.loads(tx.sendto.call_args.args[0])['mode'], 2)
         tx.sendto.side_effect = OSError('unreachable')

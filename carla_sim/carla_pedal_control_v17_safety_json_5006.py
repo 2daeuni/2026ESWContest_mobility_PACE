@@ -70,6 +70,11 @@ FRONT_RADAR_HORIZONTAL_FOV = 14.0
 FRONT_RADAR_VERTICAL_FOV = 10.0
 FRONT_RADAR_POINTS_PER_SECOND = 1800
 FRONT_RADAR_SENSOR_TICK = 0.05
+# Safety corridor filtering (independent from display distance)
+SAFETY_RADAR_AZIMUTH_DEG = 4.0
+SAFETY_RADAR_ALTITUDE_DEG = 3.0
+SAFETY_RADAR_MIN_POINTS = 3
+SAFETY_RADAR_FRESHNESS_S = 0.2
 
 
 # ============================================================
@@ -193,6 +198,7 @@ UI_SEND_INTERVAL = 1.0 / UI_SEND_HZ
 # O 키 가상 야간 장애물은 실제 actor 생성 전에도
 # Safety ECU에서 동일한 장애물로 추적할 수 있도록 고정 양수 ID를 사용.
 NIGHT_SCENARIO_OBSTACLE_ID = 900001
+RADAR_OBSTACLE_ID = 900002
 
 # Safety ECU용 실제 전방 차량 탐색 범위.
 SAFETY_FRONT_MAX_DISTANCE_M = 50.0
@@ -672,6 +678,7 @@ def build_safety_telemetry(
     virtual_obstacle_distance,
     virtual_obstacle_materialized=False,
     gear="D",
+    front_distance_sensor=None,
 ):
     """Create the exact JSON object expected by Pi Safety ECU."""
     vehicle_speed_kmh = max(
@@ -683,6 +690,22 @@ def build_safety_telemetry(
     distance_m = None
     closing_speed_mps = None
     ttc_s = None
+
+    # Read front Radar distance.
+    # This value is not used for Safety decisions yet.
+    radar_distance_m = None
+
+    if gear == "D" and front_distance_sensor is not None:
+        radar_distance_m = front_distance_sensor.get_safety_corridor_distance()
+
+        if radar_distance_m is not None:
+            radar_distance_m = float(radar_distance_m)
+
+            if not math.isfinite(radar_distance_m):
+                radar_distance_m = None
+
+            elif not 0.0 <= radar_distance_m <= FRONT_DISTANCE_RANGE:
+                radar_distance_m = None
 
     # Virtual preview is valid only before the real obstacle is spawned.
     # After handoff, use current actor detection, including an absent obstacle.
@@ -739,12 +762,39 @@ def build_safety_telemetry(
             )
 
         if detected_vehicle is not None:
+            # Preserve existing vehicle Actor tracking.
             obstacle_id = int(detected_vehicle["actor"].id)
             distance_m = float(detected_vehicle["distance_m"])
             closing_speed_mps = float(
                 detected_vehicle["closing_speed_mps"]
             )
             ttc_s = detected_vehicle["ttc_s"]
+
+        elif gear == "D" and radar_distance_m is not None:
+            # Radar fallback when no vehicle Actor is selected.
+            obstacle_id = RADAR_OBSTACLE_ID
+            distance_m = float(radar_distance_m)
+
+            ego_forward = (
+                ego_vehicle
+                .get_transform()
+                .get_forward_vector()
+            )
+
+            closing_speed_mps = max(
+                0.0,
+                float(
+                    get_forward_speed_mps(
+                        ego_vehicle,
+                        ego_forward,
+                    )
+                ),
+            )
+
+            if closing_speed_mps > 0.0:
+                ttc_s = distance_m / closing_speed_mps
+            else:
+                ttc_s = None
 
 
     return {
@@ -1426,6 +1476,10 @@ class FrontDistanceSensor:
         # 충돌 직후 잠깐 0.00 m를 유지
         self.collision_zero_until = 0.0
 
+        # Independent safety-corridor Radar measurement
+        self.safety_corridor_distance = None
+        self.last_safety_valid_time = 0.0
+
         bbox = self.parent.bounding_box
 
         # ----------------------------------------------------
@@ -1557,16 +1611,41 @@ class FrontDistanceSensor:
         now = time.monotonic()
 
         valid_depths = []
+        safety_depths = []
 
         for detection in radar_data:
             depth = float(detection.depth)
 
-            if (
-                0.02
-                < depth
-                <= FRONT_DISTANCE_RANGE
-            ):
+            if not math.isfinite(depth):
+                continue
+
+            if 0.02 < depth <= FRONT_DISTANCE_RANGE:
+                # Existing display-distance processing
                 valid_depths.append(depth)
+
+                # Safety corridor: only returns near the forward centerline
+                azimuth_deg = math.degrees(float(detection.azimuth))
+                altitude_deg = math.degrees(float(detection.altitude))
+
+                if (
+                    math.isfinite(azimuth_deg)
+                    and math.isfinite(altitude_deg)
+                    and abs(azimuth_deg) <= SAFETY_RADAR_AZIMUTH_DEG
+                    and abs(altitude_deg) <= SAFETY_RADAR_ALTITUDE_DEG
+                ):
+                    safety_depths.append(depth)
+
+        # Safety measurement is independent from the display filter.
+        # Do not retain an old detection when this frame has no valid target.
+        if len(safety_depths) >= SAFETY_RADAR_MIN_POINTS:
+            safety_depths.sort()
+
+            self.safety_corridor_distance = median(
+                safety_depths[:DISTANCE_CLOSEST_POINT_COUNT]
+            )
+            self.last_safety_valid_time = now
+        else:
+            self.safety_corridor_distance = None
 
         # ----------------------------------------------------
         # 감지 점이 있는 경우
@@ -1667,6 +1746,41 @@ class FrontDistanceSensor:
             return 0.0
 
         return self.distance
+
+    def get_safety_distance(self):
+        """Return only fresh Radar distance for Safety ECU."""
+        now = time.monotonic()
+
+        # A recent collision must remain visible as zero distance.
+        if now < self.collision_zero_until:
+            return 0.0
+
+        # No fresh Radar measurement.
+        if (
+            self.last_valid_time <= 0.0
+            or now - self.last_valid_time > 0.2
+        ):
+            return None
+
+        return self.get_distance()
+
+    def get_safety_corridor_distance(self):
+        """Return a fresh Radar target in the forward safety corridor."""
+        now = time.monotonic()
+
+        if now < self.collision_zero_until:
+            return 0.0
+
+        if self.safety_corridor_distance is None:
+            return None
+
+        if (
+            self.last_safety_valid_time <= 0.0
+            or now - self.last_safety_valid_time > SAFETY_RADAR_FRESHNESS_S
+        ):
+            return None
+
+        return self.safety_corridor_distance
 
     def destroy(self):
         if self.radar_sensor is not None:
@@ -2722,32 +2836,99 @@ class SafetyControlReceiver:
         self.risk_level = 0
         self.failsafe = False
 
+        # Safety UDP packet validation
+        self.allowed_sender_ip = "192.168.0.37"
+        self.last_sequence = None
+        self.session_id = None
+        self.retired_sessions = set()
+
     def receive(self, now):
         # Bound work per frame even if a sender floods this port.
         for _ in range(256):
             try:
-                data, _ = self.socket.recvfrom(4096)
+                data, sender_addr = self.socket.recvfrom(4096)
             except BlockingIOError:
                 break
             except OSError as error:
                 print(f"[CARLA SAFETY] RECEIVE ERROR: {error}")
                 break
+
+            # 1. Sender IP validation
+            if sender_addr[0] != self.allowed_sender_ip:
+                continue
+
             try:
                 packet = json.loads(data)
-                if not isinstance(packet, dict) or packet.get("type") != "safety_control":
+
+                if (
+                    not isinstance(packet, dict)
+                    or packet.get("type") != "safety_control"
+                ):
                     continue
+
                 mode = packet["mode"]
                 limit = packet["limit_percent"]
                 risk = packet["risk_level"]
-                if (type(mode) is not int or mode not in (0, 1, 2)
-                        or type(limit) not in (int, float) or not 0 <= limit <= 100
-                        or type(risk) is not int or risk not in (0, 1, 2, 3)
-                        or type(packet["sequence"]) is not int
-                        or type(packet["failsafe"]) is not bool):
+                sequence = packet["sequence"]
+                failsafe = packet["failsafe"]
+                session_id = packet["session_id"]
+
+                # 2. Validate packet fields
+                if (
+                    type(mode) is not int
+                    or mode not in (0, 1, 2)
+                    or type(limit) not in (int, float)
+                    or not 0 <= limit <= 100
+                    or type(risk) is not int
+                    or risk not in (0, 1, 2, 3)
+                    or type(sequence) is not int
+                    or sequence < 0
+                    or type(failsafe) is not bool
+                    or not isinstance(session_id, str)
+                    or len(session_id) != 32
+                    or any(c not in "0123456789abcdef" for c in session_id)
+                ):
                     continue
-                self.mode, self.limit_percent, self.risk_level = mode, limit, risk
-                self.failsafe = packet["failsafe"]
+
+                # 3. Reject previously retired sessions
+                if session_id in self.retired_sessions:
+                    continue
+
+                # 4. Handle sender process restart
+                if self.session_id != session_id:
+                    if self.session_id is not None:
+                        # Do not switch while old session is fresh
+                        old_fresh = (
+                            self.last_rx is not None
+                            and 0 <= now - self.last_rx < self.timeout
+                        )
+                        if old_fresh:
+                            continue
+
+                        # New session must begin in a safe state
+                        if not (mode == 2 or failsafe):
+                            continue
+
+                        self.retired_sessions.add(self.session_id)
+
+                    self.session_id = session_id
+                    self.last_sequence = None
+
+                # 5. Reject duplicate or out-of-order sequences
+                if (
+                    self.last_sequence is not None
+                    and sequence <= self.last_sequence
+                ):
+                    continue
+
+                # 6. Only accepted packets update control state
+                self.last_sequence = sequence
+                self.mode = mode
+                self.limit_percent = limit
+                self.risk_level = risk
+                self.failsafe = failsafe
                 self.last_rx = now
+
             except (ValueError, KeyError, TypeError, UnicodeError):
                 continue
 
@@ -2927,6 +3108,7 @@ def main():
     last_status_time = 0.0
     last_telemetry_send_time = 0.0
     last_ui_send_time = 0.0
+    last_radar_debug_time = 0.0
     telemetry_sequence = 0
 
     try:
@@ -4271,7 +4453,34 @@ def main():
                     virtual_obstacle_distance,
                     virtual_obstacle_materialized=(night_obstacle is not None),
                     gear=applied_gear,
+                    front_distance_sensor=front_distance_sensor,
                 )
+
+                # Radar / Safety telemetry diagnostic (1 Hz)
+                if now - last_radar_debug_time >= 1.0:
+                    radar_display_distance = (
+                        front_distance_sensor.get_safety_distance()
+                        if front_distance_sensor is not None
+                        else None
+                    )
+
+                    radar_safety_distance = (
+                        front_distance_sensor.get_safety_corridor_distance()
+                        if front_distance_sensor is not None
+                        else None
+                    )
+
+                    print(
+                        "\n[OBSTACLE DEBUG] "
+                        f"GEAR={applied_gear} "
+                        f"RADAR_DISPLAY={radar_display_distance} "
+                        f"RADAR_SAFETY={radar_safety_distance} "
+                        f"TX_DISTANCE={telemetry_payload['distance_m']} "
+                        f"TX_TTC={telemetry_payload['ttc_s']} "
+                        f"TX_OBSTACLE_ID={telemetry_payload['obstacle_id']}"
+                    )
+
+                    last_radar_debug_time = now
 
                 telemetry_message = json.dumps(
                     telemetry_payload,
