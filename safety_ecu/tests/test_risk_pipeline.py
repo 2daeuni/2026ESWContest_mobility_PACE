@@ -176,7 +176,7 @@ class RiskPolicyTest(unittest.TestCase):
         receiver.sock = Mock()
         wire = dict(source='CARLA', sequence=1, vehicle_speed_kmh=50,
                     distance_m=None, closing_speed_mps=None, ttc_s=None, obstacle_id=None)
-        receiver.sock.recvfrom.return_value = (json.dumps(wire).encode(), ('192.168.50.1', 5006))
+        receiver.sock.recvfrom.return_value = (json.dumps(wire).encode(), ('192.168.0.57', 5006))
         with patch('carla.receiver_v2.time.monotonic', return_value=100):
             self.assertTrue(receiver.receive())
         state = SystemState()

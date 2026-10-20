@@ -12,6 +12,8 @@ Item {
     property var level: 0
     property var distance: null        // 화면에 표시할 앞차 거리 (Safety ECU 값 우선)
     property bool braking: false
+    property var rearDistance: null    // R 기어: 후방 장애물 거리
+    readonly property bool rear: cam.view === "rear"
     clip: true
 
     readonly property real iw: cam.w || 16
@@ -48,6 +50,22 @@ Item {
             var ctx = getContext("2d")
             ctx.reset()
             var o = view.ov
+            if (view.rear) {
+                // 후진 가이드선 (빨강 0.5 m · 노랑 1 m · 초록 3 m)
+                var G = o.guides || []
+                ctx.lineCap = "round"
+                for (var gi = 0; gi < G.length; gi++) {
+                    var gp = G[gi].pts
+                    if (!gp || gp.length < 2) continue
+                    ctx.lineWidth = Math.max(2.5, 4 * view.sc)
+                    ctx.strokeStyle = G[gi].c === "red" ? "#FF3B30" : (G[gi].c === "yellow" ? "#FFCC00" : "#34C759")
+                    ctx.beginPath()
+                    ctx.moveTo(mx(gp[0]), my(gp[0]))
+                    for (var gj = 1; gj < gp.length; gj++) ctx.lineTo(mx(gp[gj]), my(gp[gj]))
+                    ctx.stroke()
+                }
+                return
+            }
             var L = o.lane_left || [], R = o.lane_right || []
             var lead = o.lead_box
 
@@ -120,7 +138,7 @@ Item {
         id: gapPill
         readonly property var lead: view.ov.lead_box
         readonly property var gapM: Theme.has(view.distance) ? view.distance : view.ov.lead_gap
-        visible: !!lead && Theme.has(gapM)
+        visible: !view.rear && !!lead && Theme.has(gapM)
         x: lead ? Math.max(6, Math.min(view.width - width - 6, view.ox + (lead[0] + lead[2]) / 2 * view.sc - width / 2)) : 0
         y: lead ? Math.max(6, view.oy + lead[1] * view.sc - height - 10) : 0
         width: gapText.width + 18; height: 26; radius: 13
@@ -132,6 +150,40 @@ Item {
             font.pixelSize: 14
             font.weight: Font.Bold
             color: "white"
+        }
+    }
+
+    // ---------- 후진: R 태그 + 후방 거리 ----------
+    Row {
+        visible: view.rear
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 12
+        spacing: 8
+        Rectangle {
+            width: rTag.width + 16; height: 26; radius: 13
+            color: Qt.rgba(0.07, 0.08, 0.1, 0.72)
+            Text { id: rTag; anchors.centerIn: parent; text: "R  후방"; font.pixelSize: 13; font.weight: Font.Bold; color: "white" }
+        }
+        Rectangle {
+            id: rearPill
+            readonly property var gapM: Theme.has(view.rearDistance) ? view.rearDistance : view.ov.rear_gap
+            visible: Theme.has(gapM) && gapM < 20
+            width: rearText.width + 18; height: 26; radius: 13
+            color: !visible ? "transparent" : (gapM < 0.6 ? "#FF3B30" : (gapM < 1.2 ? "#FF9500" : (gapM < 2.0 ? "#E0B000" : Qt.rgba(0.2, 0.68, 0.35, 0.92))))
+            SequentialAnimation on opacity {
+                running: rearPill.visible && rearPill.gapM < 0.6
+                loops: Animation.Infinite
+                NumberAnimation { to: 0.35; duration: 250 }
+                NumberAnimation { to: 1.0; duration: 250 }
+                onRunningChanged: if (!running) rearPill.opacity = 1
+            }
+            Text {
+                id: rearText
+                anchors.centerIn: parent
+                text: Theme.has(parent.gapM) ? "후방 " + parent.gapM.toFixed(parent.gapM < 10 ? 1 : 0) + " m" : ""
+                font.pixelSize: 14; font.weight: Font.Bold; color: "white"
+            }
         }
     }
 
@@ -167,7 +219,7 @@ Item {
             spacing: 6
             Rectangle { width: 7; height: 7; radius: 3.5; color: "#FF4D4D"; anchors.verticalCenter: parent.verticalCenter }
             Text {
-                text: "CARLA CAM" + (view.cam.fps ? "  " + view.cam.fps.toFixed(0) + " fps" : "")
+                text: (view.rear ? "CARLA 후방 CAM" : "CARLA CAM") + (view.cam.fps ? "  " + view.cam.fps.toFixed(0) + " fps" : "")
                 font.pixelSize: 12
                 font.weight: Font.Bold
                 color: "white"

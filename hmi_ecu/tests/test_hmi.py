@@ -123,32 +123,44 @@ class EventTest(unittest.TestCase):
 
 
 class PublisherCompatTest(unittest.TestCase):
-    """safety_ecu/hmi_publisher.py 가 보낸 패킷을 HMI 가 그대로 이해하는지."""
+    """Verify that HMI understands packets from the current Safety sender."""
 
-    def test_roundtrip(self):
-        from hmi_publisher import HMIPublisher
-
-        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        rx.bind(("127.0.0.1", 0))
-        rx.settimeout(1.0)
-        port = rx.getsockname()[1]
-
+    @staticmethod
+    def sample():
         state = types.SimpleNamespace(
             accelerator=70, brake=0, accelerator_rate=120.5, brake_rate=0.0,
             pedal_connected=True, pedal_sensor_status=0,
-            tof_connected=True, distance_valid=True, distance_cm=850.0,
+            tof_connected=True, carla_connected=False,
+            distance_valid=True, distance_cm=850.0,
             vehicle_speed=None, ttc=None,
             bns=0.0, pms=0.0, total_risk=0.0, risk_level=0,
             haptic_connected=True, haptic_available=True, haptic_fault_code=0,
         )
         commands = {"haptic": {"vibration_command": 0, "intensity": 0, "frequency": 0},
                     "motor": {"control_mode": 0, "output_limit": 100, "command_flags": 1}}
+        values = dict(input_mode="HARDWARE", bns_available=False, pms_available=True,
+                      risk_available=False, failsafe_active=False, failsafe_reason=None,
+                      commands=commands, motor_connected=True)
+        return state, values
 
-        pub = HMIPublisher(port=port)
-        self.assertTrue(pub.publish(state, False, True, False, False, None, commands, force=True))
-        packet = json.loads(rx.recvfrom(65535)[0])
-        pub.close()
-        rx.close()
+    def test_roundtrip(self):
+        from hmi_sender import HmiSender
+
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.bind(("127.0.0.1", 0))
+        rx.settimeout(1.0)
+        port = rx.getsockname()[1]
+
+        state, values = self.sample()
+        sender = HmiSender()
+        sender.target = ("127.0.0.1", port)
+        sender.start()
+        try:
+            sender.publish(state, **values)
+            packet = json.loads(rx.recvfrom(65535)[0])
+        finally:
+            sender.close()
+            rx.close()
 
         s = state_merge.merge({}, {"data": packet, "t": 5.0}, now=5.0)
         self.assertEqual(s["accelerator"], 70)
@@ -158,12 +170,17 @@ class PublisherCompatTest(unittest.TestCase):
         self.assertTrue(s["link_safety"])
 
     def test_publish_never_raises_when_no_listener(self):
-        from hmi_publisher import HMIPublisher
-        pub = HMIPublisher(port=9)   # 아무도 안 듣는 포트
-        state = types.SimpleNamespace()
-        for _ in range(3):
-            pub.publish(state, False, False, False, False, None, {}, force=True)
-        pub.close()
+        from hmi_sender import HmiSender
+
+        state, values = self.sample()
+        sender = HmiSender()
+        sender.target = ("127.0.0.1", 9)
+        sender.start()
+        try:
+            for _ in range(3):
+                sender.publish(state, **values)
+        finally:
+            sender.close()
 
 
 if __name__ == "__main__":

@@ -120,3 +120,45 @@ class TcpRoundTripTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RearGuideTest(unittest.TestCase):
+    """후방 카메라 가이드선 투영 = 실제 카메라 행렬 투영(좌우 반전)과 같은지"""
+
+    def test_matches_camera_matrix(self):
+        import math
+        w, h, cam_h, a_deg, L = 640, 360, 0.85, cs.REAR_PITCH, 2.3
+        K = cs.intrinsics(w, h, cs.REAR_FOV)
+        a = math.radians(a_deg)
+        fwd = (-math.cos(a), 0.0, -math.sin(a))
+        right = (0.0, -1.0, 0.0)
+        up = (-math.sin(a), 0.0, math.cos(a))
+        pos = (-L, 0.0, cam_h)
+
+        def row(v):
+            return [v[0], v[1], v[2], -(v[0] * pos[0] + v[1] * pos[1] + v[2] * pos[2])]
+        inv = [row(fwd), row(right), row(up), [0, 0, 0, 1]]
+        for d, lat in ((0.5, 1.0), (1.0, -1.0), (3.0, 0.4)):
+            u, v, _ = cs.world_to_pixel(inv, K, (-L - d, lat, 0.0))
+            p = cs.rear_cam_pixel(K, w, cam_h, a_deg, d, lat)
+            self.assertAlmostEqual(p[0], round(w - u, 1), places=0)
+            self.assertAlmostEqual(p[1], round(v, 1), places=0)
+
+    def test_guides_colors_and_mirror(self):
+        K = cs.intrinsics(640, 360, cs.REAR_FOV)
+        g = cs.rear_guides(K, 640, 360, 0.85, cs.REAR_PITCH, 1.1)
+        self.assertEqual({x["c"] for x in g}, {"red", "yellow", "green"})
+        # 운전자 오른쪽 선이 화면 오른쪽 (룸미러처럼)
+        right = cs.rear_cam_pixel(K, 640, 0.85, cs.REAR_PITCH, 2.0, 1.1)
+        left = cs.rear_cam_pixel(K, 640, 0.85, cs.REAR_PITCH, 2.0, -1.1)
+        self.assertGreater(right[0], left[0])
+
+
+class HitDirectionTest(unittest.TestCase):
+    def test_directions(self):
+        import carla_hmi_bridge as b
+        self.assertEqual(b.hit_direction(0, 1, 0), "전방")
+        self.assertEqual(b.hit_direction(0, 0, 1), "우측")
+        self.assertEqual(b.hit_direction(0, -1, 0), "후방")
+        self.assertEqual(b.hit_direction(90, 1, 0), "좌측")
+        self.assertEqual(b.hit_direction(0, 1, -1), "전방 좌측")

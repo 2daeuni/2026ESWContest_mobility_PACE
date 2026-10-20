@@ -6,7 +6,7 @@ import time
 class CarlaReceiverV2:
     def __init__(
         self,
-        host="192.168.50.2",
+        host="192.168.0.37",
         port=5006,
         timeout=0.5
     ):

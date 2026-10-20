@@ -24,7 +24,10 @@ Item {
         border.color: Theme.border
 
         // CARLA 카메라 영상이 들어오면 실제 렌더링 화면, 없거나 DEMO 주행이면 그래픽 도로 화면
-        readonly property bool useCam: !!(hmi.camera && hmi.camera.fresh) && !page.s.demo_drive
+        // (가상 DEMO 주행만 그래픽 화면, DEMO · CARLA / LIVE 는 CARLA 실제 영상. R 기어면 후방 영상이 올 때만)
+        readonly property bool useCam: !!(hmi.camera && hmi.camera.fresh)
+                                       && !(page.s.demo_drive && !page.s.demo_carla)
+                                       && (page.s.gear !== "R" || hmi.camera.view === "rear")
         CameraView {
             visible: parent.useCam
             anchors.fill: parent
@@ -32,6 +35,7 @@ Item {
             cam: hmi.camera
             level: page.s.risk_level
             distance: page.s.distance_m
+            rearDistance: page.s.rear_distance_m
             braking: (page.s.brake || 0) > 3
         }
         DriveVis3D {
@@ -39,6 +43,8 @@ Item {
             anchors.fill: parent
             anchors.margins: 6
             camView: "driver"
+            reverse: page.s.gear === "R"              // 후진 기어 → 후방 카메라
+            rearDistance: page.s.rear_distance_m
             labelTop: 84
             world: page.world
             msaa: SceneEnvironment.Medium

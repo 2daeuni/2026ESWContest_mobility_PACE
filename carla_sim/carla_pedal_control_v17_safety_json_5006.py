@@ -9,6 +9,8 @@ import random
 import time
 import weakref
 
+from obstacle_sensing import find_path_obstacle_for_safety
+
 
 # ============================================================
 # CARLA / WINDOW
@@ -670,6 +672,30 @@ def find_rear_vehicle_for_safety(
     return closest
 
 
+
+def find_extra_obstacle_for_safety(world, ego_vehicle, gear):
+    """Find pedestrian or static obstacles without replacing vehicle tracking."""
+    if gear not in ("D", "R"):
+        return None
+
+    try:
+        result = find_path_obstacle_for_safety(
+            carla,
+            world,
+            ego_vehicle,
+            max_distance=SAFETY_FRONT_MAX_DISTANCE_M,
+            reverse=(gear == "R"),
+            kinds=("walker", "static"),
+        )
+    except (RuntimeError, ValueError, TypeError, AttributeError):
+        return None
+
+    if result is None or result.get("kind") not in ("walker", "static"):
+        return None
+
+    return result
+
+
 def build_safety_telemetry(
     world,
     ego_vehicle,
@@ -748,6 +774,7 @@ def build_safety_telemetry(
 
 
     else:
+        candidates = []
         detected_vehicle = None
 
         if gear == "D":
@@ -762,39 +789,43 @@ def build_safety_telemetry(
             )
 
         if detected_vehicle is not None:
-            # Preserve existing vehicle Actor tracking.
-            obstacle_id = int(detected_vehicle["actor"].id)
-            distance_m = float(detected_vehicle["distance_m"])
-            closing_speed_mps = float(
-                detected_vehicle["closing_speed_mps"]
-            )
-            ttc_s = detected_vehicle["ttc_s"]
+            candidates.append({
+                "obstacle_id": int(detected_vehicle["actor"].id),
+                "distance_m": float(detected_vehicle["distance_m"]),
+                "closing_speed_mps": float(detected_vehicle["closing_speed_mps"]),
+                "ttc_s": detected_vehicle["ttc_s"],
+            })
 
-        elif gear == "D" and radar_distance_m is not None:
-            # Radar fallback when no vehicle Actor is selected.
-            obstacle_id = RADAR_OBSTACLE_ID
-            distance_m = float(radar_distance_m)
+        extra_obstacle = find_extra_obstacle_for_safety(world, ego_vehicle, gear)
+        if extra_obstacle is not None:
+            candidates.append(extra_obstacle)
 
-            ego_forward = (
-                ego_vehicle
-                .get_transform()
-                .get_forward_vector()
-            )
-
-            closing_speed_mps = max(
+        if gear == "D" and radar_distance_m is not None:
+            ego_forward = ego_vehicle.get_transform().get_forward_vector()
+            radar_closing = max(
                 0.0,
-                float(
-                    get_forward_speed_mps(
-                        ego_vehicle,
-                        ego_forward,
-                    )
+                float(get_forward_speed_mps(ego_vehicle, ego_forward)),
+            )
+            candidates.append({
+                "obstacle_id": RADAR_OBSTACLE_ID,
+                "distance_m": radar_distance_m,
+                "closing_speed_mps": radar_closing,
+                "ttc_s": radar_distance_m / radar_closing if radar_closing > 0.0 else None,
+            })
+
+        if candidates:
+            selected = min(
+                candidates,
+                key=lambda target: (
+                    target["distance_m"],
+                    target["ttc_s"] if target["ttc_s"] is not None else math.inf,
                 ),
             )
+            obstacle_id = int(selected["obstacle_id"])
+            distance_m = float(selected["distance_m"])
+            closing_speed_mps = float(selected["closing_speed_mps"])
+            ttc_s = selected["ttc_s"]
 
-            if closing_speed_mps > 0.0:
-                ttc_s = distance_m / closing_speed_mps
-            else:
-                ttc_s = None
 
 
     return {

@@ -49,6 +49,7 @@ exec(
     ),
     NAMESPACE,
 )
+NAMESPACE["find_extra_obstacle_for_safety"] = lambda world, ego, gear: None
 
 def vector(x=0.0, y=0.0, z=0.0):
     return SimpleNamespace(x=x, y=y, z=z)

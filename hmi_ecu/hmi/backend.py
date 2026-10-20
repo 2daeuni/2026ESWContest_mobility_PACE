@@ -71,7 +71,7 @@ class HmiBackend(QObject):
         self._crash_seen_n = None
         self.camera_provider = CameraImageProvider()
         self._cam_pending = None          # 아직 디코딩 안 한 최신 (header, jpeg, t)
-        self._cam = {"fresh": False, "frameId": 0, "w": 0, "h": 0, "mode": "", "overlay": {}, "fps": 0.0, "kb": 0}
+        self._cam = {"fresh": False, "frameId": 0, "w": 0, "h": 0, "mode": "", "view": "front", "overlay": {}, "fps": 0.0, "kb": 0}
         self._cam_t = None
         self._cam_count = 0
         self._cam_status = {"ok": False, "text": "대기"}
@@ -148,7 +148,9 @@ class HmiBackend(QObject):
             col = payload.get("collision")
             if col and col.get("n") != self._collision_n:
                 if self._collision_n is not None or (col.get("age") or 99) < 1.0:
-                    self._add_event("danger", "CARLA 충돌 감지: " + str(col.get("with", "")))
+                    d = col.get("dir") or ""
+                    self._add_event("danger", "CARLA 충돌 감지{}: {}".format(" (" + d + ")" if d else "",
+                                                                         col.get("with", "")))
                 self._collision_n = col.get("n")
         elif kind == "camera":
             self._cam_pending = (payload[0], payload[1], t)    # 최신 것만 남김 (밀린 프레임은 디코딩 안 함)
@@ -207,6 +209,8 @@ class HmiBackend(QObject):
             fresh_hit = (col.get("age") if col.get("age") is not None else 99) < 1.5
             if fresh_hit and col.get("n") != self._crash_seen_n and self._carla_crash is None:
                 self._carla_crash = col.get("with", "") or "obstacle"      # RESET 전까지 충돌 화면 유지
+                if col.get("dir"):
+                    self._carla_crash = col["dir"] + " · " + self._carla_crash
                 self._add_event("danger", "DEMO 충돌 (CARLA: {}) · RESET 으로 다시 시작".format(self._carla_crash))
             if fresh_hit:
                 self._crash_seen_n = col.get("n")
@@ -297,6 +301,7 @@ class HmiBackend(QObject):
                     "frameId": cam["frameId"] + 1,
                     "w": img.width(), "h": img.height(),
                     "mode": header.get("mode", ""),
+                    "view": header.get("view", "front"),
                     "overlay": header.get("overlay") or {},
                     "kb": len(jpeg) // 1024,
                 })

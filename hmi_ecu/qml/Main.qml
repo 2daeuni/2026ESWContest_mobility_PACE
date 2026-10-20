@@ -39,6 +39,7 @@ Window {
     World3D {
         id: world3d
         carlaMap: hmi.carlaMap
+        reverse: win.s.gear === "R"
         sc: win.s.scene || ({})
         speed: win.s.speed_kmh || 0
         level: win.s.risk_level || 0

@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from safety_ecu.carla.control_sender import CarlaControlSender
+from safety_ecu.carla.receiver_v2 import CarlaReceiverV2
 from safety_ecu.control.command_mapper import CommandMapper
 
 SOURCE = Path(__file__).resolve().parents[1] / 'carla_pedal_control_v17_safety_json_5006.py'
@@ -52,6 +53,20 @@ exec(
     NS,
 )
 
+EXTRA_OBSTACLE_FUNCTION = next(
+    node for node in TREE.body
+    if isinstance(node, ast.FunctionDef)
+    and node.name == "find_extra_obstacle_for_safety"
+)
+exec(
+    compile(
+        ast.Module(body=[EXTRA_OBSTACLE_FUNCTION], type_ignores=[]),
+        str(SOURCE),
+        "exec",
+    ),
+    NS,
+)
+
 CREEP_NODES = [n for n in TREE.body if (
     isinstance(n, ast.Assign) and any(
         isinstance(t, ast.Name) and t.id.startswith('CREEP_') for t in n.targets
@@ -61,6 +76,35 @@ exec(compile(ast.Module(body=CREEP_NODES, type_ignores=[]), str(SOURCE), 'exec')
 
 
 class SafetyControlTests(unittest.TestCase):
+    def test_extra_obstacle_accepts_walker_and_static_only(self):
+        detector = Mock(return_value={"kind": "walker", "obstacle_id": 42})
+        world = object()
+        ego = object()
+        carla_module = object()
+        with patch.dict(NS, {
+            "carla": carla_module,
+            "SAFETY_FRONT_MAX_DISTANCE_M": 50.0,
+            "find_path_obstacle_for_safety": detector,
+        }):
+            self.assertEqual(
+                NS["find_extra_obstacle_for_safety"](world, ego, "R"),
+                {"kind": "walker", "obstacle_id": 42},
+            )
+            detector.assert_called_once_with(
+                carla_module, world, ego, max_distance=50.0, reverse=True,
+                kinds=("walker", "static"),
+            )
+            detector.return_value = {"kind": "static", "obstacle_id": 43}
+            self.assertEqual(
+                NS["find_extra_obstacle_for_safety"](world, ego, "D")["obstacle_id"],
+                43,
+            )
+            detector.return_value = {"kind": "vehicle", "obstacle_id": 44}
+            self.assertIsNone(NS["find_extra_obstacle_for_safety"](world, ego, "D"))
+            detector.reset_mock()
+            self.assertIsNone(NS["find_extra_obstacle_for_safety"](world, ego, "P"))
+            detector.assert_not_called()
+
     def test_radar_safety_distance_freshness(self):
         sensor = NS["FrontDistanceSensor"].__new__(
             NS["FrontDistanceSensor"]
@@ -254,6 +298,7 @@ class SafetyControlTests(unittest.TestCase):
             radar_distance=None,
             front=None,
             rear=None,
+            extra=None,
             speed_mps=10.0,
             virtual_active=False,
             virtual_distance=None,
@@ -278,6 +323,9 @@ class SafetyControlTests(unittest.TestCase):
                 "find_rear_vehicle_for_safety": (
                     lambda world, vehicle: rear
                 ),
+                "find_extra_obstacle_for_safety": (
+                    lambda world, vehicle, gear: extra
+                ),
             }
 
             with patch.dict(NS, globals_for_test):
@@ -299,11 +347,36 @@ class SafetyControlTests(unittest.TestCase):
         self.assertEqual(result["closing_speed_mps"], 10.0)
         self.assertEqual(result["ttc_s"], 0.5)
 
-        # 2. 자동차가 있으면 기존 Actor 우선
-        result = run_case(radar_distance=5.0, front=front_vehicle)
+        # 2. The closest physical obstacle wins across sources.
+        result = run_case(radar_distance=20.0, front=front_vehicle)
         self.assertEqual(result["obstacle_id"], 1234)
         self.assertEqual(result["distance_m"], 12.0)
         self.assertEqual(result["ttc_s"], 3.0)
+
+        walker = {"obstacle_id": 42, "distance_m": 4.0,
+                  "closing_speed_mps": 2.0, "ttc_s": 2.0}
+        result = run_case(radar_distance=5.0, extra=walker)
+        self.assertEqual(result["obstacle_id"], 42)
+        self.assertEqual(result["ttc_s"], 2.0)
+
+        result = run_case(radar_distance=5.0, front=front_vehicle, extra=walker)
+        self.assertEqual(result["obstacle_id"], 42)
+
+        distant_vehicle = dict(front_vehicle, distance_m=30.0, ttc_s=7.5)
+        pedestrian = dict(walker, distance_m=5.0, ttc_s=2.5)
+        result = run_case(radar_distance=3.0, front=distant_vehicle, extra=pedestrian)
+        self.assertEqual(result["obstacle_id"], 900002)
+        self.assertEqual(result["distance_m"], 3.0)
+        self.assertAlmostEqual(result["ttc_s"], 0.3)
+        receiver = CarlaReceiverV2()
+        receiver.sock = Mock()
+        receiver.sock.recvfrom.return_value = (
+            json.dumps(result).encode("utf-8"), ("192.168.0.57", 5006)
+        )
+        self.assertEqual((receiver.host, receiver.port), ("192.168.0.37", 5006))
+        self.assertTrue(receiver.receive())
+        self.assertEqual(receiver.obstacle_id, 900002)
+        self.assertEqual(receiver.distance_m, 3.0)
 
         # 3. 자동차와 Radar 모두 없을 때
         result = run_case()
@@ -323,6 +396,12 @@ class SafetyControlTests(unittest.TestCase):
         )
         self.assertEqual(result["obstacle_id"], 1234)
         self.assertEqual(result["distance_m"], 8.0)
+
+        rear_static = {"obstacle_id": 800123, "distance_m": 4.0,
+                       "closing_speed_mps": 2.0, "ttc_s": 2.0}
+        result = run_case(gear="R", radar_distance=3.0, rear=rear_vehicle,
+                          extra=rear_static)
+        self.assertEqual(result["obstacle_id"], 800123)
 
         # 5. 주차 상태에서는 장애물 선택 안 함
         result = run_case(gear="P", radar_distance=5.0)
@@ -357,7 +436,7 @@ class SafetyControlTests(unittest.TestCase):
 
         # 9. 가상 장애물이 실제 Actor로 전환된 뒤
         result = run_case(
-            radar_distance=5.0,
+            radar_distance=20.0,
             front=front_vehicle,
             virtual_active=True,
             virtual_distance=30.0,

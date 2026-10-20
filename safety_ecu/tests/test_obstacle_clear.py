@@ -37,7 +37,8 @@ class ObstacleClearTests(unittest.TestCase):
     def setUp(self):
         self.detect = Mock(return_value=None)
         self.ns = dict(get_speed_kmh=lambda ego: 30., get_forward_speed_mps=lambda *args: 5.,
-                       NIGHT_SCENARIO_OBSTACLE_ID=900001, find_front_vehicle_for_safety=self.detect)
+                       NIGHT_SCENARIO_OBSTACLE_ID=900001, find_front_vehicle_for_safety=self.detect,
+                       find_extra_obstacle_for_safety=lambda world, ego, gear: None)
         exec(compile(ast.Module(body=[NODE], type_ignores=[]), str(SOURCE), 'exec'), self.ns)
         self.build = self.ns['build_safety_telemetry']
         self.ego = Mock()
@@ -69,7 +70,7 @@ class ObstacleClearTests(unittest.TestCase):
             nonlocal seq
             packet = dict(packet, sequence=seq)
             seq += 1
-            receiver.sock.recvfrom.return_value = (json.dumps(packet).encode(), ('192.168.50.1', 5006))
+            receiver.sock.recvfrom.return_value = (json.dumps(packet).encode(), ('192.168.0.57', 5006))
             with patch('carla.receiver_v2.time.monotonic', return_value=100.):
                 self.assertTrue(receiver.receive())
             state.update_carla(receiver)

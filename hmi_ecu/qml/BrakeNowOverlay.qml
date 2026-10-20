@@ -179,7 +179,7 @@ Item {
         Repeater {
             model: [
                 ["속도", Theme.has(ov.s.speed_kmh) ? Math.round(ov.s.speed_kmh) + " km/h" : "--"],
-                ["전방 거리", Theme.has(ov.s.distance_m) ? Theme.fmt(ov.s.distance_m, 1) + " m" : "--"],
+                [ov.s.gear === "R" ? "후방 거리" : "장애물 거리", Theme.has(ov.s.distance_m) ? Theme.fmt(ov.s.distance_m, 1) + " m" : "--"],
                 ["충돌 예상", Theme.has(ov.s.ttc_s) ? Theme.fmt(ov.s.ttc_s, 1) + " 초" : "--"]
             ]
             Rectangle {

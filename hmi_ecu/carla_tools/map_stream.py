@@ -107,6 +107,7 @@ class MapCache:
                 mc.boxes.append({
                     "x": bb.location.x, "y": bb.location.y, "yaw": bb.rotation.yaw,
                     "l": e.x * 2, "w": e.y * 2, "h": e.z * 2,
+                    "z0": bb.location.z - e.z, "z1": bb.location.z + e.z, "label": name,
                 })
         return mc
 
@@ -188,7 +189,11 @@ def _interp(center, x):
     return center[-1][1]
 
 
-def front_static_gap(boxes, pose, ego_len, center=None, half_width=1.15, ahead=60.0, step=0.5):
+# 다리 상판처럼 자차가 "위에 올라가는" 구조물은 전방 장애물이 아님
+NOT_FRONT_OBSTACLE = ("Bridge",)
+
+
+def front_static_gap(boxes, pose, ego_len, center=None, half_width=1.15, ahead=60.0, step=0.5, ego_z=None):
     """
     자차 진행 경로(차선 위면 차선 중심선을 따라, 아니면 정면 직선) 폭 2.3 m 안에 들어오는
     가장 가까운 정적 물체까지의 범퍼 거리 (m). 없으면 None.
@@ -199,6 +204,12 @@ def front_static_gap(boxes, pose, ego_len, center=None, half_width=1.15, ahead=6
     best = None
     lim2 = (ahead + 30.0) ** 2
     for b in boxes:
+        if b.get("label") in NOT_FRONT_OBSTACLE:
+            continue
+        # 높이: 자차 높이(바닥~2 m)와 겹치지 않는 물체(다리 아래·고가 위 등)는 제외
+        if ego_z is not None and b.get("z0") is not None:
+            if b["z1"] < ego_z + 0.25 or b["z0"] > ego_z + 2.0:
+                continue
         dx, dy = b["x"] - ex, b["y"] - ey
         if dx * dx + dy * dy > lim2 + (b["l"] + b["w"]) ** 2:
             continue

@@ -318,6 +318,8 @@ def merge(can_store, udp_store, now=None):
 
     s["demo_drive"] = False
     s["demo_carla"] = False
+    s["rear_distance_m"] = None
+    s["rear_kind"] = None
     s["demo_collided"] = False
     s["demo_input"] = ""
 
@@ -392,10 +394,25 @@ def apply_carla(s, scene_packet):
             s["speed_source"] = "CARLA"
     if s.get("gear") is None:
         s["gear"] = _gear(ego.get("gear"))
+    rd, rk = carla_rear(scene_packet)
+    s["rear_distance_m"] = rd
+    s["rear_kind"] = rk
     if s.get("distance_m") is None:
         lead = scene_packet.get("lead") or {}
         s["distance_m"] = _num(lead.get("distance"))
     return s
+
+
+def carla_rear(packet):
+    """후방 가장 가까운 물체 (차량 / 벽·건물) 범퍼 거리 m 와 종류"""
+    c = []
+    r = _num((packet.get("rear") or {}).get("distance"))
+    if r is not None:
+        c.append((r, "vehicle"))
+    r = _num(packet.get("rear_static"))
+    if r is not None:
+        c.append((r, "static"))
+    return min(c) if c else (None, None)
 
 
 def apply_carla_ui(s, ui_store, now):
@@ -419,15 +436,33 @@ def carla_inputs(s, packet):
     ego = packet.get("ego") or {}
     lead = packet.get("lead") or {}
     cands = []
+    if "radar" in packet:
+        # 브리지가 Safety 와 같은 근거리 레이더 방식 결과를 보냄 → 그대로 사용 (모든 방향, None = 없음)
+        r = packet.get("radar") or {}
+        dist = _num(r.get("distance"))
+        kind = {"vehicle": "vehicle", "walker": "vehicle"}.get(r.get("kind"), "static") if dist is not None else None
+        closing = _num(r.get("closing"))
+        s["obstacle_dir"] = r.get("dir") if dist is not None else None
+        return _with_pedals(s, ego, dist, closing, kind)
+    if s.get("gear") == "R":          # 후진: 후방 거리 + 후진 속도로 판정 (후진 중 가속 페달 오조작)
+        dist, kind = carla_rear(packet)
+        v = _num(packet.get("ego_v_fwd"))
+        closing = -v if v is not None else None
+        if dist is not None:
+            cands.append((dist, closing, kind))
+        lead = {}
     if _num(lead.get("distance")) is not None:
         cands.append((_num(lead.get("distance")), _num(lead.get("closing")), "vehicle"))
-    if _num(packet.get("front_static")) is not None:
+    if s.get("gear") != "R" and _num(packet.get("front_static")) is not None:
         v = _num(packet.get("ego_v_fwd"))
         if v is None:
             v = (_num(ego.get("speed_kmh")) or 0.0) / 3.6
         cands.append((_num(packet.get("front_static")), v, "static"))
     dist, closing, kind = min(cands, key=lambda c: c[0]) if cands else (None, None, None)
+    return _with_pedals(s, ego, dist, closing, kind)
 
+
+def _with_pedals(s, ego, dist, closing, kind):
     real_pedal = s.get("pedal_source") in ("CAN", "UDP") and s.get("accelerator") is not None
     if real_pedal:
         acc, brk, rate, src = s["accelerator"], s.get("brake") or 0.0, s.get("accelerator_rate"), s["pedal_source"]
@@ -479,9 +514,12 @@ def apply_carla_local(s, inp, out, collided=False, collided_with=""):
                        "subtitle": "DEMO · CARLA — Collision " + (collided_with or "")}
     else:
         b = _level_banner(s)
+        d = s.get("obstacle_dir") or "전방"
         if lv >= 1 and inp["kind"] == "static":
-            b["title"] = b["title"].replace("전방 상황에", "전방 장애물에")
-        b["subtitle"] = "DEMO · CARLA — " + b["subtitle"]
+            b["title"] = b["title"].replace("전방 상황에", d + " 장애물에")
+        elif lv >= 1:
+            b["title"] = b["title"].replace("전방 상황에", d + " 상황에")
+        b["subtitle"] = "DEMO · CARLA — " + b["subtitle"] + ("" if d == "전방" else " · " + d)
         s["banner"] = b
     s["missing_inputs"] = []
     return s

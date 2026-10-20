@@ -14,7 +14,8 @@ Node {
     property var level: 0
     property bool braking: false
     property var distance: null          // 전방 거리 라벨 (Safety ECU 값 우선, 없으면 CARLA/DEMO)
-    property var carlaMap: ({})          // hmi.carlaMap : CARLA 실제 도로/차선/건물 (앵커 좌표)
+    property var carlaMap: ({})
+    property bool reverse: false         // 후진 기어 → 뒤쪽 주차 가이드선          // hmi.carlaMap : CARLA 실제 도로/차선/건물 (앵커 좌표)
     readonly property bool mapOn: !!(sc && sc.has_map && carlaMap && carlaMap.ver !== undefined
                                      && carlaMap.ver !== null && carlaMap.ver === sc.map_ver)
     // Latch ROAD3D across elevated plateaus; only return at the entry height.
@@ -220,6 +221,41 @@ Node {
                 eulerRotation.y: -modelData.yaw
                 scale: Qt.vector3d(modelData.w / 100, modelData.h / 100, modelData.l / 100)
                 materials: PrincipledMaterial { baseColor: w.boxColor; roughness: 0.9; specularAmount: 0.1 }
+            }
+        }
+    }
+
+    // ---------------- 후진 주차 가이드선 (뒤 범퍼에서 0.5 / 1 / 2 / 4 m) ----------------
+    // 선 하나 = Model 하나 (points + width). 맵 차선(strips)과 섞이지 않게 따로 둠
+    Node {
+        id: guides
+        visible: w.reverse
+        readonly property real r0: -((w.sc && w.sc.ego && w.sc.ego.length) ? w.sc.ego.length : 4.7) / 2 - 0.1
+        readonly property real hw: 0.95
+        readonly property var segs: [
+            // [x0, y0, x1, y1, 폭, 색]  (x: 자차 앞 +, 뒤 −)
+            [r0, -hw, r0 - 0.5, -hw, 0.09, "red"], [r0, hw, r0 - 0.5, hw, 0.09, "red"],
+            [r0 - 0.5, -hw, r0 - 0.5, -hw + 0.35, 0.07, "red"], [r0 - 0.5, hw, r0 - 0.5, hw - 0.35, 0.07, "red"],
+            [r0 - 0.5, -hw, r0 - 1.0, -hw, 0.09, "yellow"], [r0 - 0.5, hw, r0 - 1.0, hw, 0.09, "yellow"],
+            [r0 - 1.0, -hw, r0 - 1.0, -hw + 0.35, 0.07, "yellow"], [r0 - 1.0, hw, r0 - 1.0, hw - 0.35, 0.07, "yellow"],
+            [r0 - 1.0, -hw, r0 - 4.0, -hw, 0.09, "green"], [r0 - 1.0, hw, r0 - 4.0, hw, 0.09, "green"],
+            [r0 - 2.0, -hw, r0 - 2.0, -hw + 0.3, 0.06, "green"], [r0 - 2.0, hw, r0 - 2.0, hw - 0.3, 0.06, "green"],
+            [r0 - 4.0, -hw, r0 - 4.0, -hw + 0.3, 0.06, "green"], [r0 - 4.0, hw, r0 - 4.0, hw - 0.3, 0.06, "green"]
+        ]
+        Repeater3D {
+            model: guides.segs
+            delegate: Model {
+                required property var modelData
+                geometry: RibbonGeometry {
+                    points: [[modelData[0], modelData[1]], [modelData[2], modelData[3]]]
+                    width: modelData[4]
+                    lift: 0.03
+                }
+                materials: PrincipledMaterial {
+                    baseColor: modelData[5] === "red" ? Theme.red : modelData[5] === "yellow" ? Theme.yellow : Theme.green
+                    lighting: PrincipledMaterial.NoLighting
+                    cullMode: Material.NoCulling
+                }
             }
         }
     }

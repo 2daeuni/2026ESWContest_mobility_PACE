@@ -572,6 +572,55 @@ class FrameSender(
 # CARLA FRONT DRIVER CAMERA
 # =====================================================================
 
+REAR_FOV = 110.0
+REAR_PITCH = 30.0                      # 아래로 (도)
+
+# 후방 가이드선 구간: (시작 m, 끝 m, 색)  — 뒤 범퍼 기준 거리
+REAR_GUIDE_BANDS = ((0.0, 0.5, "red"), (0.5, 1.0, "yellow"), (1.0, 3.0, "green"))
+
+
+def rear_cam_pixel(K, w, cam_h, pitch_deg, back, lateral):
+    """
+    후방 카메라 영상(좌우 반전 후) 픽셀.
+    back: 뒤 범퍼에서 뒤쪽 거리 (m), lateral: 운전자 기준 오른쪽 + (m), 지면 높이 0
+    """
+    a = math.radians(pitch_deg)
+    X, Z = back, -cam_h                         # 카메라 수평 기준: 앞(=차 뒤쪽), 위
+    xc = X * math.cos(a) - Z * math.sin(a)
+    zc = X * math.sin(a) + Z * math.cos(a)
+    if xc <= 0.05:
+        return None
+    f, cx, cy = K
+    yc = -lateral                               # 뒤를 보는 카메라의 오른쪽 = 차의 왼쪽
+    u = cx + f * yc / xc
+    v = cy - f * zc / xc
+    return [round(w - u, 1), round(v, 1)]       # 좌우 반전 (룸미러처럼)
+
+
+def rear_guides(K, w, h, cam_h, pitch_deg, half_w):
+    """후진 가이드선: 양옆 선(구간별 색) + 0.5/1/2/3 m 가로선. [{"c", "pts"}]"""
+    out = []
+    for d0, d1, color in REAR_GUIDE_BANDS:
+        n = 6
+        for side in (-1, 1):
+            pts = []
+            for i in range(n + 1):
+                d = d0 + (d1 - d0) * i / n
+                p = rear_cam_pixel(K, w, cam_h, pitch_deg, max(0.02, d), side * half_w)
+                if p is not None:
+                    pts.append(p)
+            if len(pts) >= 2:
+                out.append({"c": color, "pts": pts})
+    for d, color in ((0.5, "red"), (1.0, "yellow"), (2.0, "green"), (3.0, "green")):
+        a = rear_cam_pixel(K, w, cam_h, pitch_deg, d, -half_w)
+        b = rear_cam_pixel(K, w, cam_h, pitch_deg, d, half_w)
+        if a and b:
+            q = 0.22                                       # 가로선은 양 끝만 짧게
+            out.append({"c": color, "pts": [a, [a[0] + (b[0] - a[0]) * q, a[1] + (b[1] - a[1]) * q]]})
+            out.append({"c": color, "pts": [b, [b[0] + (a[0] - b[0]) * q, b[1] + (a[1] - b[1]) * q]]})
+    return out
+
+
 class ChaseCamera:
     """
     기존 클래스 이름 ChaseCamera는
@@ -706,7 +755,7 @@ class ChaseCamera:
         _ = back
         _ = up
 
-        def make(kind):
+        def make(kind, rel=rel, fov=fov):
             bp = bp_lib.find(
                 "sensor.camera."
                 + kind
@@ -801,6 +850,69 @@ class ChaseCamera:
             self._on_rgb
         )
 
+        # ----------------------------------------------------------
+        # REAR CAMERA (R 기어일 때만 생성 → 평소 CARLA 부담 없음)
+        # 뒤 범퍼 가운데, 뒤를 보고 약간 아래로. 영상은 좌우 반전(룸미러처럼)
+        # ----------------------------------------------------------
+        self._make = make
+        self.rear = None
+        self.reverse = False
+        self.rear_fov = REAR_FOV
+        self.rear_K = intrinsics(width, height, REAR_FOV)
+        self.rear_h = max(0.5, 1.15 * ext.z)
+        self.rear_pitch = REAR_PITCH
+        self.half_w = ext.y
+        self.rear_rel = carla.Transform(
+            carla.Location(x=-ext.x - 0.05, y=0.0, z=self.rear_h),
+            carla.Rotation(pitch=-REAR_PITCH, yaw=180.0, roll=0.0),
+        )
+
+    # =================================================================
+    # 후방 카메라 켜기/끄기 (브리지가 매 루프 기어로 호출)
+    # =================================================================
+
+    def set_reverse(self, on):
+        on = bool(on)
+        if on == self.reverse:
+            return
+        self.reverse = on
+        if on and self.rear is None:
+            try:
+                self.rear = self._make("rgb", rel=self.rear_rel, fov=self.rear_fov)
+                self.rear.listen(self._on_rear)
+                print("[camera] R 기어 → 후방 카메라")
+            except Exception as error:
+                print("[camera] 후방 카메라 생성 실패:", error)
+                self.rear = None
+        elif not on and self.rear is not None:
+            try:
+                self.rear.stop()
+                self.rear.destroy()
+            except Exception:
+                pass
+            if self.rear in self.actors:
+                self.actors.remove(self.rear)
+            self.rear = None
+            print("[camera] D/P 기어 → 전방 카메라")
+
+    def _on_rear(self, image):
+        np = self.np
+        bgra = np.frombuffer(image.raw_data, dtype=np.uint8).reshape(image.height, image.width, 4)
+        rgb = bgra[:, ::-1, 2::-1]                     # BGRA → RGB + 좌우 반전
+        buf = io.BytesIO()
+        self.Image.fromarray(np.ascontiguousarray(rgb)).save(buf, format="JPEG", quality=self.quality)
+        with self.lock:
+            src = self.overlay_src or {}
+        header = {
+            "v": 1, "type": "camera_frame", "frame": image.frame, "t": image.timestamp,
+            "w": self.w, "h": self.h, "mode": self.mode, "view": "rear",
+            "overlay": {"guides": rear_guides(self.rear_K, self.w, self.h, self.rear_h, self.rear_pitch,
+                                              self.half_w + 0.15),
+                        "rear_gap": src.get("rear_gap")},
+        }
+        self.sender.offer(header, buf.getvalue())
+        self.frames += 1
+
     # =================================================================
     # OVERLAY SOURCE
     # =================================================================
@@ -846,6 +958,8 @@ class ChaseCamera:
         self,
         image,
     ):
+        if self.reverse and self.rear is not None:
+            return                       # 후진 중에는 후방 영상만 보냄
         np = self.np
 
         bgra = (
@@ -940,6 +1054,7 @@ class ChaseCamera:
             "w": self.w,
             "h": self.h,
             "mode": self.mode,
+            "view": "front",
             "overlay": overlay,
         }
 
