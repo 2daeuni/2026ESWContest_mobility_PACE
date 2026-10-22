@@ -1,7 +1,20 @@
 ﻿/*@!Encoding:65001*/
+// ============================================================================
 // Haptic ECU simulation node
+// Reference implementation: haptic_ecu/Core/Src/main.c
 // Rx: HAPTIC_COMMAND (0x110)
 // Tx: HAPTIC_STATUS (0x200), 10 ms
+//
+// - Frame check: standard ID, data frame, DLC 8
+// - Command check (HapticCommand_IsValid): risk 0..3, vib 0/1, reserved bytes 0,
+//   OFF -> intensity 0 and frequency 0, ON -> intensity 1..100 % and frequency 10..50 Hz
+// - Invalid command  -> vibration OFF, FaultCode INVALID_COMMAND, timeout NOT refreshed
+// - Alive duplicate  -> vibration OFF, FaultCode COMMUNICATION, timeout NOT refreshed
+// - Valid command    -> timeout refreshed, INVALID/COMMUNICATION fault cleared
+// - No valid command for 100 ms -> CmdTimeout 1, risk 0, vibration OFF
+// - Haptic::FaultInject = 1 simulates the P2000 actuator USB disconnect
+//   (FaultCode DRIVER, ECU Status Error, applied output 0)
+// ============================================================================
 
 includes
 {
@@ -9,127 +22,207 @@ includes
 
 variables
 {
-  const int PACE_CYCLE_MS   = 10;   // all messages are 10 ms cyclic
-  const int PACE_TIMEOUT_MS = 50;   // common reception timeout (5 cycles)
+  const long  STATUS_PERIOD_MS          = 10;
+  const long  TIMEOUT_CHECK_PERIOD_MS   = 1;
+  const float HAPTIC_COMMAND_TIMEOUT_MS = 100.0;
+
+  const int FAULT_NO_FAULT        = 0;
+  const int FAULT_ACTUATOR        = 1;
+  const int FAULT_DRIVER          = 2;
+  const int FAULT_INVALID_COMMAND = 3;
+  const int FAULT_COMMUNICATION   = 4;
+
+  const int ECU_STATUS_ERROR  = 0;
+  const int ECU_STATUS_NORMAL = 1;
 
   message HAPTIC_STATUS mSts;
-  msTimer tCycle;
+  msTimer tStatus;
+  msTimer tTimeout;
 
-  byte  aliveCnt;
-  float lastCmdRx;
+  // Command state
+  byte  currentRiskLevel;
+  byte  faultCode;
+  byte  commandTimeout;
+  byte  ecuStatus;
+  float lastCommandTime;
+  int   commandReceivedOnce;
+  int   timeoutStopDone;
+  byte  previousCommandAlive;
+  int   aliveReceivedOnce;
 
-  long  curRisk;
-  long  vibOn;
-  long  intensity;
-  long  frequency;
-  int   invalidCmd;
+  // Target output requested by the last processed command
+  byte  targetOn;
+  byte  targetIntensity;
+  byte  targetFrequency;
+
+  // Applied output (P2000 report sent)
+  byte  appliedOn;
+  byte  appliedIntensity;
+  byte  appliedFrequency;
+  int   usbReady;
+
+  byte  statusAlive;
 }
 
 on start
 {
-  aliveCnt   = 0;
-  lastCmdRx  = nowMs();
-  curRisk    = 0;
-  vibOn      = 0;
-  intensity  = 0;
-  frequency  = 0;
-  invalidCmd = 0;
-  setTimer(tCycle, PACE_CYCLE_MS);
+  currentRiskLevel     = 0;
+  faultCode            = FAULT_NO_FAULT;
+  commandTimeout       = 1;
+  ecuStatus            = ECU_STATUS_NORMAL;
+  lastCommandTime      = nowMs();
+  commandReceivedOnce  = 0;
+  timeoutStopDone      = 0;
+  previousCommandAlive = 0;
+  aliveReceivedOnce    = 0;
+  targetOn = 0; targetIntensity = 0; targetFrequency = 0;
+  appliedOn = 0; appliedIntensity = 0; appliedFrequency = 0;
+  usbReady = 1;
+  statusAlive = 0;
+  setTimer(tStatus, STATUS_PERIOD_MS);
+  setTimer(tTimeout, TIMEOUT_CHECK_PERIOD_MS);
 }
 
 on message HAPTIC_COMMAND
 {
-  long r;
-  long c;
-  long i;
-  long f;
+  byte risk;
+  byte vib;
+  byte inten;
+  byte freq;
+  byte alive;
 
   if (this.dir != RX) return;
-  lastCmdRx = nowMs();   // any received frame refreshes the 50 ms timeout
+  if (this.dlc != 8) return;              // DLC check
 
-  r = this.HapCmd_RiskLevel;
-  c = this.HapCmd_VibCmd;
-  i = this.HapCmd_Intensity;
-  f = this.HapCmd_Frequency;
+  risk  = this.byte(0);
+  vib   = this.byte(1);
+  inten = this.byte(2);
+  freq  = this.byte(3);
+  alive = this.byte(7);
 
-  if (!isValidCommand(r, c, i, f))
+  if (!isValidCommand(risk, vib, inten, freq, this.byte(4), this.byte(5), this.byte(6)))
   {
-    invalidCmd = 1;   // keep the last applied state, report INVALID_COMMAND
-    return;
+    applyCommand(0, 0, 0, 0);
+    faultCode = FAULT_INVALID_COMMAND;
+    return;                               // timeout reference not refreshed
   }
 
-  invalidCmd = 0;
-  curRisk = r;
-  if (c == 1)
+  if (aliveReceivedOnce && (alive == previousCommandAlive))
   {
-    vibOn     = 1;
-    intensity = i;
-    frequency = f;
+    applyCommand(0, 0, 0, 0);
+    faultCode = FAULT_COMMUNICATION;
+    return;                               // timeout reference not refreshed
   }
-  else
+
+  // Valid command
+  lastCommandTime      = nowMs();
+  commandReceivedOnce  = 1;
+  commandTimeout       = 0;
+  timeoutStopDone      = 0;
+  previousCommandAlive = alive;
+  aliveReceivedOnce    = 1;
+
+  applyCommand(risk, vib, inten, freq);
+
+  if ((faultCode == FAULT_INVALID_COMMAND) || (faultCode == FAULT_COMMUNICATION))
   {
-    // VibCmd = 0 -> OFF regardless of the other fields
-    vibOn     = 0;
-    intensity = 0;
-    frequency = 0;
+    faultCode = FAULT_NO_FAULT;
   }
 }
 
-int isValidCommand(long r, long c, long i, long f)
+int isValidCommand(byte risk, byte vib, byte inten, byte freq, byte r4, byte r5, byte r6)
 {
-  if (r > 3) return 0;
-  if (c > 1) return 0;
-  if (c == 1)
+  if (risk > 3) return 0;
+  if (vib > 1) return 0;
+  if ((r4 != 0) || (r5 != 0) || (r6 != 0)) return 0;
+  if (vib == 0)
   {
-    if (i > 100) return 0;
-    if ((f < 10) || (f > 50)) return 0;
+    if ((inten != 0) || (freq != 0)) return 0;
+    return 1;
   }
+  if ((inten < 1) || (inten > 100)) return 0;
+  if ((freq < 10) || (freq > 50)) return 0;
   return 1;
 }
 
-on timer tCycle
+// HapticCommand_Process(): risk level is taken from the command, actuator ON/OFF
+void applyCommand(byte risk, byte vib, byte inten, byte freq)
 {
-  int  cmdTimeout;
-  long fault;
-  long outOn;
-  long outI;
-  long outF;
-
-  setTimer(tCycle, PACE_CYCLE_MS);
-
-  cmdTimeout = (nowMs() - lastCmdRx) >= PACE_TIMEOUT_MS;
-
-  fault = clampL(@Haptic::FaultInject, 0, 4);
-  if ((fault == 0) && invalidCmd) fault = 3;   // INVALID_COMMAND
-
-  outOn = vibOn;
-  outI  = intensity;
-  outF  = frequency;
-
-  // Command timeout or actuator/driver fault -> vibration OFF
-  if (cmdTimeout || (fault == 1) || (fault == 2))
+  currentRiskLevel = risk;
+  if (vib == 0)
   {
-    outOn = 0;
-    outI  = 0;
-    outF  = 0;
+    targetOn = 0; targetIntensity = 0; targetFrequency = 0;
+  }
+  else
+  {
+    targetOn = 1; targetIntensity = inten; targetFrequency = freq;
+  }
+}
+
+// HapticTimeout_Process()
+on timer tTimeout
+{
+  setTimer(tTimeout, TIMEOUT_CHECK_PERIOD_MS);
+
+  if (commandReceivedOnce == 0)
+  {
+    commandTimeout = 1;
+    return;
+  }
+  if ((nowMs() - lastCommandTime) >= HAPTIC_COMMAND_TIMEOUT_MS)
+  {
+    commandTimeout = 1;
+    currentRiskLevel = 0;
+    if (timeoutStopDone == 0)
+    {
+      targetOn = 0; targetIntensity = 0; targetFrequency = 0;
+      timeoutStopDone = 1;
+      write("Haptic: HAPTIC_COMMAND TIMEOUT -> Haptic OFF");
+    }
+  }
+}
+
+on timer tStatus
+{
+  setTimer(tStatus, STATUS_PERIOD_MS);
+
+  // P2000 USB link (Haptic::FaultInject = 1 -> disconnected)
+  if (@Haptic::FaultInject == 0)
+  {
+    if (usbReady == 0)
+    {
+      usbReady = 1;
+      ecuStatus = ECU_STATUS_NORMAL;
+      if (faultCode == FAULT_DRIVER) faultCode = FAULT_NO_FAULT;
+    }
+    // Applied state = last command sent to the actuator
+    appliedOn        = targetOn;
+    appliedIntensity = targetIntensity;
+    appliedFrequency = targetFrequency;
+  }
+  else
+  {
+    usbReady = 0;
+    appliedOn = 0; appliedIntensity = 0; appliedFrequency = 0;
+    ecuStatus = ECU_STATUS_ERROR;
+    faultCode = FAULT_DRIVER;
   }
 
-  @Haptic::VibOutput = outOn;   // panel LED
+  @Haptic::VibOutput = appliedOn;   // panel LED
 
   if (@Haptic::TxStop == 1) return;
 
-  mSts.HapSts_RiskLevel     = curRisk;
-  mSts.HapSts_VibStatus     = outOn;
-  mSts.HapSts_Intensity     = outI;
-  mSts.HapSts_Frequency     = outF;
-  mSts.HapSts_FaultCode     = fault;
-  mSts.HapSts_CmdTimeout    = cmdTimeout;
-  // ECU Status: 1 = normal, 0 = error (any fault code set)
-  if (fault == 0) mSts.HapSts_EcuStatus = 1;
-  else            mSts.HapSts_EcuStatus = 0;
-  mSts.HapSts_AliveCnt      = aliveCnt;
+  mSts.dlc = 8;
+  mSts.byte(0) = currentRiskLevel;
+  mSts.byte(1) = appliedOn;
+  mSts.byte(2) = appliedIntensity;
+  mSts.byte(3) = appliedFrequency;
+  mSts.byte(4) = faultCode;
+  mSts.byte(5) = commandTimeout;
+  mSts.byte(6) = ecuStatus;
+  mSts.byte(7) = statusAlive;
   output(mSts);
-  aliveCnt = nextCnt(aliveCnt);
+  statusAlive = nextCnt(statusAlive);
 }
 
 // ---- Common helpers ----
@@ -137,26 +230,6 @@ on timer tCycle
 float nowMs()
 {
   return timeNow() / 100.0;
-}
-
-// Round half away from zero
-long roundL(float x)
-{
-  if (x >= 0) return (long)(x + 0.5);
-  return (long)(x - 0.5);
-}
-
-long clampL(long x, long lo, long hi)
-{
-  if (x < lo) return lo;
-  if (x > hi) return hi;
-  return x;
-}
-
-long minL(long a, long b)
-{
-  if (a < b) return a;
-  return b;
 }
 
 // Alive counter: 0 -> 255 -> 0

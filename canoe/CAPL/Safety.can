@@ -1,9 +1,21 @@
 ﻿/*@!Encoding:65001*/
+// ============================================================================
 // Safety ECU (Raspberry Pi) simulation node
-// Tx: HAPTIC_COMMAND (0x110), MOTOR_COMMAND (0x120), 10 ms
+// Reference implementation: safety_ecu/ (main.py, risk/bns.py, risk/pms.py,
+// risk/risk_manager.py, control/failsafe.py, control/command_mapper.py)
+// Input mode: CARLA (the real Safety ECU runs INPUT_MODE = CARLA).
+// In CANoe the CARLA link is replaced by a simulated environment
+// (obstacle distance, vehicle speed, closing speed, TTC).
+//
 // Rx: PEDAL_STATUS (0x100), HAPTIC_STATUS (0x200), MOTOR_STATUS (0x210)
-// Risk level is computed automatically from ToF distance, vehicle speed and pedal input
-// (BNS = w1*distance risk + w2*TTC risk, PMS = w3*pedal input + w4*pedal rate, Total = BNS + PMS -> Risk Level). Safety::AutoRisk = 0 switches to manual Safety::RiskLevel (debug/test).
+// Tx: HAPTIC_COMMAND (0x110), MOTOR_COMMAND (0x120), 10 ms
+//
+// Timing:
+//   - Risk evaluation runs every RISK_EVAL_PERIOD_MS (the Python main loop
+//     evaluates once per loop iteration, about 1 ms). The 3-up / 5-down
+//     confirmation counts are evaluation counts, not CAN frame counts.
+//   - Commands are transmitted every 10 ms with the latest evaluated state.
+// ============================================================================
 
 includes
 {
@@ -11,502 +23,803 @@ includes
 
 variables
 {
-  const int PACE_CYCLE_MS   = 10;   // all messages are 10 ms cyclic
-  const int PACE_TIMEOUT_MS = 50;   // common reception timeout (5 cycles)
+  // ---- Timing ----
+  const long  CMD_TX_PERIOD_MS        = 10;
+  const long  RISK_EVAL_PERIOD_MS     = 1;
+  const float PEDAL_TIMEOUT_MS        = 100.0;   // main.py: >= 0.1 s -> pedal disconnected
+  const float HAPTIC_TIMEOUT_MS       = 100.0;   // state.check_haptic_freshness(timeout=0.1)
+  const float MOTOR_STATUS_FRESH_MS   = 100.0;   // main.py: 0 <= dt <= 0.1 s -> fresh
 
-  const int MODE_ACTUAL = 0;
-  const int MODE_CARLA  = 1;
+  // ---- BNS thresholds (risk/bns.py) ----
+  const float BNS_DISTANCE_L1_M = 25.0;
+  const float BNS_DISTANCE_L2_M = 15.0;
+  const float BNS_DISTANCE_L3_M = 10.0;
+  const float BNS_TTC_L1_S      = 4.0;
+  const float BNS_TTC_L2_S      = 2.5;
+  const float BNS_TTC_L3_S      = 1.5;
 
-  const int CTRL_NORMAL = 0;
-  const int CTRL_LIMIT  = 1;
-  const int CTRL_STOP   = 2;
+  // ---- PMS thresholds (risk/pms.py) ----
+  const float PMS_ACCEL_L1_PERCENT = 60.0;
+  const float PMS_ACCEL_L2_PERCENT = 75.0;
+  const float PMS_ACCEL_L3_PERCENT = 90.0;
+  const float PMS_ACCEL_RATE_L1    = 250.0;   // %/s
+  const float PMS_ACCEL_RATE_L2    = 450.0;
+  const float PMS_ACCEL_RATE_L3    = 650.0;
+  const long  PMS_BRAKE_SUPPRESSION_PERCENT = 5;
+  const long  PMS_CONFLICT_ACCEL_PERCENT    = 20;
+  const long  PMS_CONFLICT_BRAKE_PERCENT    = 20;
+  const float PMS_CONFLICT_SCORE            = 0.65;
 
-  const int DEGRADED_LIMIT = 30;   // output cap when a warning path is lost (assumption A6)
+  // ---- RiskManager (risk/risk_manager.py) ----
+  const long UP_CONFIRM_COUNT_REQUIRED   = 3;
+  const long DOWN_CONFIRM_COUNT_REQUIRED = 5;
+
+  // ---- Motor E-STOP recovery (main.py) ----
+  const long RECOVERY_ACCEL_MAX_PERCENT = 3;    // accelerator <= 3 %
+  const long RECOVERY_BRAKE_MAX_PERCENT = 5;    // brake < 5 %
+
+  // ---- Command mapping (control/command_mapper.py), index = risk level ----
+  byte mapVibCmd[4]    = {0,   1,  1,  1};
+  byte mapIntensity[4] = {0,  30, 45, 65};
+  byte mapFrequency[4] = {0,  20, 20, 30};
+  byte mapCtrlMode[4]  = {0,   0,  1,  2};    // Normal, Normal, Output Limit, Stop
+  byte mapOutLimit[4]  = {100, 100, 30, 0};
+
+  const int MODE_NORMAL = 0;
+  const int MODE_LIMIT  = 1;
+  const int MODE_STOP   = 2;
+  const int FLAG_VALID  = 0x01;
+  const int FLAG_ESTOP  = 0x02;
+
+  // Fail-safe reason codes (Safety::FailSafeReason)
+  const long FS_NONE         = 0;
+  const long FS_CARLA_LINK   = 1;   // CARLA_COMMUNICATION_ERROR
+  const long FS_PEDAL_COMM   = 2;   // PEDAL_COMMUNICATION_ERROR
+  const long FS_PEDAL_SENSOR = 3;   // PEDAL_SENSOR_ERROR
 
   message HAPTIC_COMMAND mHapCmd;
   message MOTOR_COMMAND  mMotCmd;
-  msTimer tCycle;
+  msTimer tEval;
+  msTimer tTx;
 
-  // Risk level -> command mapping (assumption A1), index = risk level 0..3
-  byte mapVibCmd[4]    = {0,   1,   1,  1};
-  byte mapIntensity[4] = {0,  40,  80, 100};
-  byte mapFrequency[4] = {0,  20,  35,  50};
-  byte mapCtrlMode[4]  = {0,   0,   0,   1};   // output limit only at Level 3
-  byte mapOutLimit[4]  = {100, 100, 100, 30};
+  // ---- Pedal reception (main.py PEDAL_STATUS handling) ----
+  int   pedalConnected;
+  float lastPedalTime;
+  long  prevAlive;              // -1 = None
+  long  recoveryAliveCand;      // -1 = None
+  int   pedalTimeoutReported;
+  long  accel;
+  long  brake;
+  float accelRate;
+  float brakeRate;
+  long  sensorStatus;           // -1 = None (no frame accepted yet)
 
-  byte hapCnt;
-  byte motCnt;
-
-  float lastPedalRx;
-  float lastHapStsRx;
-  float lastMotStsRx;
-
-  long  pdlAccel;
-  int   pdlAccelErr;
-  int   pdlBrakeErr;
+  // ---- Haptic status ----
+  int   hapticConnected;
+  float lastHapticTime;
   long  hapFault;
-  long  hapEcuOk;
-  long  motSpeedRaw;
-  float motSpeedPhys;
+  long  hapCmdTimeout;
+  long  hapEcuStatus;
 
-  int   activeMode;
+  // ---- Motor status ----
+  int   motStatusReceived;
+  float motLastRxTime;
+  long  motFaultFlags;
+  long  motState;
+  long  motPwm;
+  int   motRecoveryRequired;
 
-  // ---- Risk algorithm parameters (structure from presentation, values assumed) ----
-  const float TTC_INF      = 99.9;   // TTC shown when not closing in [s]
-  const float D_SAFE       = 15.0;   // distance risk 0 at or beyond this distance [m]
-  const float D_CRIT       = 1.0;    // distance risk 100 at or below this distance [m]
-  const float TTC_SAFE     = 4.0;    // TTC risk 0 at or above this TTC [s]
-  const float TTC_CRIT     = 1.0;    // TTC risk 100 at or below this TTC [s]
-  const float W1           = 0.4;    // BNS weight: distance risk
-  const float W2           = 0.6;    // BNS weight: TTC risk
-  const float W3           = 0.4;    // PMS weight: pedal input
-  const float W4           = 0.6;    // PMS weight: pedal input rate
-  const float PMS_RATE_REF = 300.0;  // pedal rate giving rate score 100 [%/s]
-  const float PMS_DECAY    = 50.0;   // PMS peak-hold decay [points/s]
-  const float PMS_IND      = 70.0;   // PMS display threshold for Safety::Misapplied
-  const float TOTAL_L1     = 60.0;   // Total >= L1 -> Level 1
-  const float TOTAL_L2     = 100.0;  // Total >= L2 -> Level 2
-  const float TOTAL_L3     = 120.0;  // Total >= L3 -> Level 3
-  const float RISK_HOLD_MS = 1000;   // risk may drop only after this time
-  // Automatic emergency stop: not defined in spec/presentation -> disabled (1 = enable)
-  const int   ENABLE_AUTO_ESTOP = 0;
-  const float TTC_ESTOP    = 1.0;    // used only when ENABLE_AUTO_ESTOP = 1
+  // ---- Simulated environment (replaces CARLA UDP) ----
+  float obsDist;                // obstacle distance [m]
 
-  long  pdlBrake;
-  float pdlAccelRate;
+  // ---- BNS / PMS / Risk ----
+  float bnsScore;
+  int   bnsAvailable;
+  int   dL1, dL2, dL3;          // distance conditions
+  int   tL1, tL2, tL3;          // TTC conditions
+  float pmsScore;
+  int   pmsAvailable;
+  int   pL1, pL2, pL3;          // pedal conditions
+  int   pedalConflict;
+  float totalRisk;
+  long  riskLevel;
+  int   riskAvailable;
+  long  candidateLevel;
+  long  prevCandidateLevel;
+  long  candidateCount;
 
-  float obsDist;          // simulated ToF distance [m]
-  float pms;              // pedal misapplication score (peak hold)
-  int   misapplied;       // latched misapplication flag
-  int   autoEStop;        // latched automatic emergency stop
-  long  riskOut;          // risk level after hysteresis
-  float riskLowSince;     // time since a lower risk is requested
+  // ---- Fail-safe ----
+  int   failsafeActive;
+  long  failsafeReason;
+
+  // ---- Environment values shown on the Panel ----
+  float envTtc;                 // valid only when envTtcValid
+  int   envTtcValid;
+
+  // ---- Alive counters ----
+  byte  hapCnt;
+  byte  motCnt;
 }
 
 on start
 {
   float t;
   t = nowMs();
-  lastPedalRx  = t;
-  lastHapStsRx = t;
-  lastMotStsRx = t;
+
+  pedalConnected       = 0;
+  lastPedalTime        = t;
+  prevAlive            = -1;
+  recoveryAliveCand    = -1;
+  pedalTimeoutReported = 0;
+  accel = 0;
+  brake = 0;
+  accelRate = 0;
+  brakeRate = 0;
+  sensorStatus = -1;
+
+  hapticConnected = 0;
+  lastHapticTime  = t;
+  hapFault        = 0;
+  hapCmdTimeout   = 1;
+  hapEcuStatus    = 0;
+
+  motStatusReceived   = 0;
+  motLastRxTime       = t;
+  motFaultFlags       = 0;
+  motState            = 0;
+  motPwm              = 0;
+  motRecoveryRequired = 1;
+
+  obsDist = @Safety::ObstacleInitDist;
+  @Safety::Collision = 0;
+
+  resetRiskState();
+  failsafeActive = 1;
+  failsafeReason = FS_PEDAL_COMM;
 
   hapCnt = 0;
   motCnt = 0;
-  pdlAccel = 0;
-  pdlAccelErr = 0;
-  pdlBrakeErr = 0;
-  hapFault = 0;
-  hapEcuOk = 1;
-  motSpeedRaw = 0xFFFF;   // invalid until the first MOTOR_STATUS
-  motSpeedPhys = 0;
 
-  pdlBrake = 0;
-  pdlAccelRate = 0;
-  obsDist = @Safety::ObstacleInitDist;
-  pms = 0;
-  misapplied = 0;
-  autoEStop = 0;
-  riskOut = 0;
-  riskLowSince = t;
-  @Safety::Collision = 0;
-
-  activeMode = @Safety::OpMode;   // mode is latched; changes only while stopped
-  @Safety::ModeChangeRejected = 0;
-  setTimer(tCycle, PACE_CYCLE_MS);
+  setTimer(tEval, RISK_EVAL_PERIOD_MS);
+  setTimer(tTx, CMD_TX_PERIOD_MS);
 }
 
+// ============================================================================
+// Reception
+// ============================================================================
+
+// PEDAL_STATUS: DLC / range check (decoder), Alive Counter check (main.py)
 on message PEDAL_STATUS
 {
+  long cur;
+  long delta;
+  long expected;
+  int  aliveValid;
+
   if (this.dir != RX) return;
-  lastPedalRx = nowMs();
-  pdlAccel = this.Pdl_AccelPedal;
-  pdlBrake = this.Pdl_BrakePedal;
-  pdlAccelRate = this.Pdl_AccelRate.phys;
-  pdlAccelErr = (this.Pdl_Err_AccelAdcRange == 1) || (this.Pdl_Err_AccelDisconnect == 1) || (this.Pdl_Err_AccelCalib == 1);
-  pdlBrakeErr = (this.Pdl_Err_BrakeAdcRange == 1) || (this.Pdl_Err_BrakeDisconnect == 1) || (this.Pdl_Err_BrakeCalib == 1);
-}
+  if (this.dlc != 8) return;                                // decoder: must be 8 bytes
+  if ((this.byte(0) > 100) || (this.byte(1) > 100)) return; // decoder: out of range
 
-on message HAPTIC_STATUS
-{
-  if (this.dir != RX) return;
-  lastHapStsRx = nowMs();
-  hapFault = this.HapSts_FaultCode;
-  hapEcuOk = this.HapSts_EcuStatus;
-}
+  cur = this.byte(7);
+  aliveValid = 0;
 
-on message MOTOR_STATUS
-{
-  if (this.dir != RX) return;
-  lastMotStsRx = nowMs();
-  motSpeedRaw  = this.MotSts_VehicleSpeed;
-  motSpeedPhys = this.MotSts_VehicleSpeed.phys;
-}
-
-on timer tCycle
-{
-  float tNow;
-  long  risk;
-  int   ctrlMode;
-  long  outLimit;
-  int   estop;
-  int   pedalTo;
-  int   hapStsTo;
-  int   motStsTo;
-  int   motMonitored;
-
-  setTimer(tCycle, PACE_CYCLE_MS);
-  tNow = nowMs();
-
-  // ---- Reception monitoring (assumption A3) ----
-  pedalTo  = (tNow - lastPedalRx)  >= PACE_TIMEOUT_MS;
-  hapStsTo = (tNow - lastHapStsRx) >= PACE_TIMEOUT_MS;
-  // In CARLA mode with the Motor ECU disabled, MOTOR_STATUS is not monitored
-  motMonitored = (activeMode == MODE_ACTUAL) || (@Safety::MotorEcuEnabled == 1);
-  motStsTo = motMonitored && ((tNow - lastMotStsRx) >= PACE_TIMEOUT_MS);
-
-  @Safety::PedalTimeout  = pedalTo;
-  @Safety::HapStsTimeout = hapStsTo;
-  @Safety::MotStsTimeout = motStsTo;
-
-  updateVehicleSpeed(motStsTo);
-
-  // ---- Risk level ----
-  if (@Safety::AutoRisk == 1)
+  if (pedalConnected == 0)
   {
-    risk = computeRisk(tNow);
+    // Recovery after timeout: two consecutive Alive values are required
+    if (recoveryAliveCand < 0)
+    {
+      recoveryAliveCand = cur;
+    }
+    else
+    {
+      expected = (recoveryAliveCand + 1) & 0xFF;
+      if (cur == expected)
+      {
+        aliveValid = 1;
+        prevAlive = cur;
+        recoveryAliveCand = -1;
+      }
+      else
+      {
+        recoveryAliveCand = cur;
+      }
+    }
   }
   else
   {
-    risk = clampL(@Safety::RiskLevel, 0, 3);   // manual (debug / test module)
-    autoEStop = 0;
-    misapplied = 0;
+    aliveValid = 1;
+    if (prevAlive >= 0)
+    {
+      delta = (cur - prevAlive) & 0xFF;
+      if (delta == 0)
+      {
+        aliveValid = 0;                                       // duplicate
+        @Safety::PedalAliveDupCnt = @Safety::PedalAliveDupCnt + 1;
+      }
+      else if (delta >= 128)
+      {
+        aliveValid = 0;                                       // backward
+        @Safety::PedalAliveBackCnt = @Safety::PedalAliveBackCnt + 1;
+      }
+      else if (delta >= 2)
+      {
+        @Safety::PedalAliveSkipCnt = @Safety::PedalAliveSkipCnt + 1;   // skip: accepted
+      }
+    }
+    if (aliveValid) prevAlive = cur;
   }
-  @Safety::RiskOut = risk;
 
-  // ---- Command generation ----
-  ctrlMode = mapCtrlMode[risk];
-  outLimit = mapOutLimit[risk];
-  estop    = 0;
-
-  // Degradation: haptic warning path lost (timeout, ECU error, actuator/driver fault) or brake sensor fault -> cap output (A6)
-  if (hapStsTo || (hapEcuOk == 0) || (hapFault == 1) || (hapFault == 2) || pdlBrakeErr)
+  if (aliveValid)
   {
-    if (ctrlMode == CTRL_NORMAL) ctrlMode = CTRL_LIMIT;
-    outLimit = minL(outLimit, DEGRADED_LIMIT);
+    accel        = this.byte(0);
+    brake        = this.byte(1);
+    accelRate    = this.Pdl_AccelRate.phys;   // int16 LE * 0.1 %/s
+    brakeRate    = this.Pdl_BrakeRate.phys;
+    sensorStatus = this.byte(6);
+    pedalConnected = 1;
+    lastPedalTime  = nowMs();
+    pedalTimeoutReported = 0;
   }
-
-  // Accelerator sensor fault, pedal loss or motor status loss -> stop (A5, A3)
-  if (pdlAccelErr || pedalTo || motStsTo)
-  {
-    ctrlMode = CTRL_STOP;
-    outLimit = 0;
-  }
-
-  // Automatic or manual emergency stop: ControlMode=Stop together with the EStop bit (A4)
-  if ((@Safety::EStopReq == 1) || autoEStop)
-  {
-    ctrlMode = CTRL_STOP;
-    outLimit = 0;
-    estop    = 1;
-  }
-
-  @Safety::CtrlModeOut = ctrlMode;
-  @Safety::OutLimitOut = outLimit;
-
-  sendHapticCommand(risk);
-  sendMotorCommand(risk, ctrlMode, outLimit, estop);
 }
 
-// ============================================================
-// Risk algorithm: ToF distance + vehicle speed + pedal -> TTC, BNS, PMS -> Risk Level
-// ============================================================
-long computeRisk(float tNow)
+// HAPTIC_STATUS: decoder validation, then state.update_haptic()
+on message HAPTIC_STATUS
 {
+  long vib;
+  long inten;
+  long freq;
+
+  if (this.dir != RX) return;
+  if (this.dlc != 8) return;
+  if (this.byte(0) > 3) return;
+  vib   = this.byte(1);
+  inten = this.byte(2);
+  freq  = this.byte(3);
+  if (vib > 1) return;
+  if (vib == 0)
+  {
+    if ((inten != 0) || (freq != 0)) return;
+  }
+  else
+  {
+    if ((inten < 1) || (inten > 100)) return;
+    if ((freq < 10) || (freq > 50)) return;
+  }
+  if (this.byte(5) > 1) return;
+  if (this.byte(6) > 1) return;
+
+  hapFault        = this.byte(4);
+  hapCmdTimeout   = this.byte(5);
+  hapEcuStatus    = this.byte(6);
+  hapticConnected = 1;
+  lastHapticTime  = nowMs();
+}
+
+// MOTOR_STATUS: decoder validation
+on message MOTOR_STATUS
+{
+  if (this.dir != RX) return;
+  if (this.dlc != 8) return;
+  if (this.byte(0) > 100) return;
+  if (this.byte(1) > 100) return;
+  if (this.byte(4) > 3) return;
+  if ((this.byte(5) & 0xF0) != 0) return;
+
+  motPwm        = this.byte(0);
+  motState      = this.byte(4);
+  motFaultFlags = this.byte(5);
+  motStatusReceived = 1;
+  motLastRxTime = nowMs();
+}
+
+// ============================================================================
+// Main loop: risk evaluation
+// ============================================================================
+on timer tEval
+{
+  float tNow;
   float dt;
-  float v;
-  float ttc;
-  float distRisk;
-  float ttcRisk;
-  float rateScore;
-  float bns;
-  float pmsInst;
-  float total;
-  long  riskReq;
 
-  dt = PACE_CYCLE_MS / 1000.0;
+  setTimer(tEval, RISK_EVAL_PERIOD_MS);
+  tNow = nowMs();
+  dt = RISK_EVAL_PERIOD_MS / 1000.0;
 
-  // Vehicle speed used for the risk (0 if invalid)
-  v = 0;
-  if (@Safety::SpeedValid == 1) v = @Safety::VehicleSpeed / 3.6;   // km/h -> m/s
-
-  // Simulated ToF sensor: a static obstacle approaches as the vehicle moves
-  obsDist = obsDist - v * dt;
-  if (obsDist <= 0)
+  // Pedal timeout
+  if ((tNow - lastPedalTime) >= PEDAL_TIMEOUT_MS)
   {
-    obsDist = 0;
-    if (v > 0.05) @Safety::Collision = 1;
-  }
-  @Safety::ToFDistance = obsDist;
-
-  // TTC = distance / closing speed (static obstacle -> own speed)
-  ttc = TTC_INF;
-  if (v > 0.05) ttc = obsDist / v;
-  if (ttc > TTC_INF) ttc = TTC_INF;
-  // After a collision the obstacle is hit: TTC 0 (latched until RESET)
-  if (@Safety::Collision == 1) ttc = 0;
-
-  // BNS (Brake Need Score, 0..100) = W1 * distance risk + W2 * TTC risk
-  distRisk = 100.0 * clampF((D_SAFE - obsDist) / (D_SAFE - D_CRIT), 0, 1);
-  ttcRisk  = 100.0 * clampF((TTC_SAFE - ttc) / (TTC_SAFE - TTC_CRIT), 0, 1);
-  bns = W1 * distRisk + W2 * ttcRisk;
-
-  // PMS (Pedal Misuse Score, 0..100) = W3 * pedal input + W4 * pedal rate score
-  pmsInst = 0;
-  if ((pdlBrake <= 5) && (pdlAccel >= 10))
-  {
-    rateScore = 100.0 * clampF(pdlAccelRate / PMS_RATE_REF, 0, 1);
-    pmsInst = W3 * clampF(pdlAccel, 0, 100) + W4 * rateScore;
-  }
-  // Peak hold with decay; released immediately by braking or lifting the accelerator
-  pms = pms - PMS_DECAY * dt;
-  if (pmsInst > pms) pms = pmsInst;
-  if ((pdlBrake > 5) || (pdlAccel < 5)) pms = pmsInst;
-  if (pms < 0) pms = 0;
-
-  // Total Risk Score -> Risk Level
-  total = bns + pms;
-  riskReq = 0;
-  if (total >= TOTAL_L1) riskReq = 1;
-  if (total >= TOTAL_L2) riskReq = 2;
-  if (total >= TOTAL_L3) riskReq = 3;
-  // Collision -> Level 3 latched until RESET
-  if (@Safety::Collision == 1) riskReq = 3;
-
-  // Optional automatic emergency stop (disabled by default)
-  autoEStop = 0;
-  if (ENABLE_AUTO_ESTOP && (ttc < TTC_ESTOP)) autoEStop = 1;
-
-  // Hysteresis: rise immediately, drop only after RISK_HOLD_MS
-  if (riskReq >= riskOut)
-  {
-    riskOut = riskReq;
-    riskLowSince = tNow;
-  }
-  else if ((tNow - riskLowSince) >= RISK_HOLD_MS)
-  {
-    riskOut = riskReq;
-    riskLowSince = tNow;
+    pedalConnected = 0;
+    if (pedalTimeoutReported == 0)
+    {
+      recoveryAliveCand = -1;
+      pedalTimeoutReported = 1;
+    }
   }
 
-  misapplied = (pms >= PMS_IND);
-  @Safety::TTC = ttc;
-  @Safety::BNS = bns;
-  @Safety::PMS = pms;
-  @Safety::TotalRisk = total;
-  @Safety::Misapplied = misapplied;
-  @Safety::AutoEStop = autoEStop;
-  return riskOut;
+  // Haptic freshness (monitored only, no command change in the real Safety ECU)
+  if (hapticConnected && ((tNow - lastHapticTime) >= HAPTIC_TIMEOUT_MS))
+  {
+    hapticConnected = 0;
+  }
+
+  evaluateRisk(dt);
+  evaluateFailsafe();
+  publishState();
 }
 
-float clampF(float x, float lo, float hi)
+void evaluateRisk(float dt)
 {
-  if (x < lo) return lo;
-  if (x > hi) return hi;
-  return x;
+  int   carlaConnected;
+  int   obstaclePresent;
+  float speedKmh;
+  float closingMps;
+  float distM;
+  float ttc;
+  int   ttcValid;
+  float vMps;
+
+  // ---- Simulated CARLA input ----
+  carlaConnected = (@Safety::EnvLink == 1);
+  obstaclePresent = (@Safety::ObstaclePresent == 1);
+  ttc = 0;
+  ttcValid = 0;
+
+  if (@Safety::EnvOvrEn == 1)
+  {
+    // Test injection: inputs given directly (same fields as one CARLA packet)
+    distM      = @Safety::EnvOvrDist;
+    speedKmh   = @Safety::EnvOvrSpeedKmh;
+    closingMps = @Safety::EnvOvrClosing;
+    ttc        = @Safety::EnvOvrTtc;
+    ttcValid   = (ttc >= 0) && obstaclePresent;
+    if (!obstaclePresent) closingMps = 0.0;
+    obsDist = distM;
+  }
+  else
+  {
+    // Vehicle physics from the Motor node model (CARLA reports speed directly)
+    vMps = @Motor::ModelSpeed;
+    if (vMps < 0) vMps = 0;
+    speedKmh = vMps * 3.6;
+
+    // Static obstacle approached by the own vehicle
+    obsDist = obsDist - vMps * dt;
+    if (obsDist <= 0)
+    {
+      obsDist = 0;
+      if (vMps > 0.05) @Safety::Collision = 1;
+    }
+    distM = obsDist;
+
+    if (obstaclePresent)
+    {
+      closingMps = vMps;
+      if (closingMps > 0)
+      {
+        ttcValid = 1;
+        ttc = distM / closingMps;
+      }
+    }
+    else
+    {
+      closingMps = 0.0;
+    }
+  }
+  envTtcValid = ttcValid;
+  envTtc = ttc;
+
+  @Safety::ToFDistance  = distM;
+  @Safety::VehicleSpeed = speedKmh;
+
+  // ---- BNS (risk/bns.py) ----
+  calcBns(carlaConnected, obstaclePresent, distM, speedKmh, closingMps, ttc, ttcValid);
+
+  // ---- PMS (risk/pms.py) ----
+  calcPms();
+
+  // ---- RiskManager (risk/risk_manager.py) ----
+  if (@Safety::AutoRisk == 0)
+  {
+    // TEST: manual risk level (not part of the real Safety ECU)
+    riskLevel = clampL(@Safety::RiskLevel, 0, 3);
+    riskAvailable = 1;
+    totalRisk = maxF(clampF(bnsScore, 0, 1), clampF(pmsScore, 0, 1));
+    return;
+  }
+  riskEvaluate();
 }
 
-// Simulation reset (Panel reset button, sysvar Safety::ObstacleReset = 1)
-// Pedals 0, all fault injections 0, obstacle placed at Safety::ObstacleInitDist, risk/score state cleared.
-// Motor.can and Pedal.can reset their own state on the same event.
+void calcBns(int connected, int obstaclePresent, float distM, float speedKmh,
+             float closingMps, float ttc, int ttcValid)
+{
+  float dm;
+  int   usableTtc;
+  float sDist;
+  float sTtc;
+
+  bnsScore = 0.0;
+  bnsAvailable = 0;
+  dL1 = 0; dL2 = 0; dL3 = 0;
+  tL1 = 0; tL2 = 0; tL3 = 0;
+
+  if (!connected) return;
+  if (speedKmh < 0) return;
+  if (obstaclePresent && (distM < 0)) return;
+  if (ttcValid && ((ttc < 0) || !obstaclePresent)) return;
+
+  bnsAvailable = 1;
+  // main.py passes distance in cm, bns.py converts back to m
+  dm = (distM * 100.0) / 100.0;
+  usableTtc = ttcValid && (closingMps > 0);
+
+  if (obstaclePresent)
+  {
+    dL1 = (dm <= BNS_DISTANCE_L1_M);
+    dL2 = (dm <= BNS_DISTANCE_L2_M);
+    dL3 = (dm <= BNS_DISTANCE_L3_M);
+  }
+  if (usableTtc)
+  {
+    tL1 = (ttc <= BNS_TTC_L1_S);
+    tL2 = (ttc <= BNS_TTC_L2_S);
+    tL3 = (ttc <= BNS_TTC_L3_S);
+  }
+
+  sDist = 0.0;
+  sTtc  = 0.0;
+  if (obstaclePresent) sDist = severityDesc(dm, BNS_DISTANCE_L1_M, BNS_DISTANCE_L2_M, BNS_DISTANCE_L3_M);
+  if (usableTtc)       sTtc  = severityDesc(ttc, BNS_TTC_L1_S, BNS_TTC_L2_S, BNS_TTC_L3_S);
+  bnsScore = maxF(sDist, sTtc);
+}
+
+void calcPms()
+{
+  float sAcc;
+  float sRate;
+
+  pmsScore = 0.0;
+  pmsAvailable = 0;
+  pedalConflict = 0;
+  pL1 = 0; pL2 = 0; pL3 = 0;
+
+  if (!pedalConnected) return;
+  if (sensorStatus != 0) return;           // also covers "None" (-1)
+  if ((accel < 0) || (accel > 100) || (brake < 0) || (brake > 100)) return;
+
+  pmsAvailable = 1;
+  pedalConflict = (accel >= PMS_CONFLICT_ACCEL_PERCENT) && (brake >= PMS_CONFLICT_BRAKE_PERCENT);
+
+  if (brake < PMS_BRAKE_SUPPRESSION_PERCENT)
+  {
+    pL1 = (accel >= PMS_ACCEL_L1_PERCENT) || (accelRate >= PMS_ACCEL_RATE_L1);
+    pL2 = (accel >= PMS_ACCEL_L2_PERCENT) || (accelRate >= PMS_ACCEL_RATE_L2);
+    pL3 = (accel >= PMS_ACCEL_L3_PERCENT) || (accelRate >= PMS_ACCEL_RATE_L3);
+    sAcc  = severityAsc(accel, PMS_ACCEL_L1_PERCENT, PMS_ACCEL_L2_PERCENT, PMS_ACCEL_L3_PERCENT);
+    sRate = severityAsc(accelRate, PMS_ACCEL_RATE_L1, PMS_ACCEL_RATE_L2, PMS_ACCEL_RATE_L3);
+    pmsScore = maxF(sAcc, sRate);
+  }
+  if (pedalConflict)
+  {
+    pL1 = 1;
+    pL2 = 1;
+    pmsScore = maxF(pmsScore, PMS_CONFLICT_SCORE);
+  }
+}
+
+// bns.py _severity: descending anchors L1=.35, L2=.65, L3=.90, zero=1
+float severityDesc(float value, float l1, float l2, float l3)
+{
+  if (value > l1) return 0.0;
+  if (value >= l2) return 0.35 + (0.65 - 0.35) * (l1 - value) / (l1 - l2);
+  if (value >= l3) return 0.65 + (0.90 - 0.65) * (l2 - value) / (l2 - l3);
+  if (value >= 0.0) return 0.90 + (1.0 - 0.90) * (l3 - value) / (l3 - 0.0);
+  return 1.0;
+}
+
+// pms.py _severity: increasing anchors .35/.65/.90, saturate one tier above L3
+float severityAsc(float value, float l1, float l2, float l3)
+{
+  float top;
+  top = l3 + l3 - l2;
+  if (value < l1) return 0.0;
+  if (value <= l2) return 0.35 + (0.65 - 0.35) * (value - l1) / (l2 - l1);
+  if (value <= l3) return 0.65 + (0.90 - 0.65) * (value - l2) / (l3 - l2);
+  if (value <= top) return 0.90 + (1.0 - 0.90) * (value - l3) / (top - l3);
+  return 1.0;
+}
+
+// risk_manager.py evaluate()
+void riskEvaluate()
+{
+  long cand;
+
+  if (!(bnsAvailable && pmsAvailable))
+  {
+    totalRisk = 0.0;
+    riskLevel = 0;
+    riskAvailable = 0;
+    candidateLevel = 0;
+    prevCandidateLevel = 0;
+    candidateCount = 0;
+    return;
+  }
+
+  totalRisk = maxF(clampF(bnsScore, 0, 1), clampF(pmsScore, 0, 1));
+
+  // 2-of-3 rule, highest level first
+  cand = 0;
+  if ((dL1 + tL1 + pL1) >= 2) cand = 1;
+  if ((dL2 + tL2 + pL2) >= 2) cand = 2;
+  if ((dL3 + tL3 + pL3) >= 2) cand = 3;
+
+  updateCandidateConfirmation(cand);
+  riskAvailable = 1;
+}
+
+// risk_manager.py update_candidate_confirmation()
+void updateCandidateConfirmation(long cand)
+{
+  candidateLevel = cand;
+
+  if (candidateLevel == prevCandidateLevel)
+  {
+    candidateCount = candidateCount + 1;
+  }
+  else
+  {
+    prevCandidateLevel = candidateLevel;
+    candidateCount = 1;
+  }
+
+  if (candidateLevel == riskLevel)
+  {
+    candidateCount = 0;
+    prevCandidateLevel = candidateLevel;
+    return;
+  }
+
+  if (candidateLevel > riskLevel)
+  {
+    if (candidateCount >= UP_CONFIRM_COUNT_REQUIRED)
+    {
+      riskLevel = candidateLevel;
+      candidateCount = 0;
+      prevCandidateLevel = riskLevel;
+    }
+    return;
+  }
+
+  // candidateLevel < riskLevel
+  if (candidateCount >= DOWN_CONFIRM_COUNT_REQUIRED)
+  {
+    riskLevel = riskLevel - 1;          // one level at a time
+    candidateCount = 0;
+    prevCandidateLevel = candidateLevel;
+  }
+}
+
+// control/failsafe.py (CARLA mode)
+void evaluateFailsafe()
+{
+  if (@Safety::EnvLink != 1)
+  {
+    failsafeActive = 1;
+    failsafeReason = FS_CARLA_LINK;
+    return;
+  }
+  if (!pedalConnected)
+  {
+    failsafeActive = 1;
+    failsafeReason = FS_PEDAL_COMM;
+    return;
+  }
+  if ((sensorStatus >= 0) && (sensorStatus != 0))
+  {
+    failsafeActive = 1;
+    failsafeReason = FS_PEDAL_SENSOR;
+    return;
+  }
+  failsafeActive = 0;
+  failsafeReason = FS_NONE;
+}
+
+void resetRiskState()
+{
+  bnsScore = 0; bnsAvailable = 0;
+  pmsScore = 0; pmsAvailable = 0;
+  dL1 = 0; dL2 = 0; dL3 = 0;
+  tL1 = 0; tL2 = 0; tL3 = 0;
+  pL1 = 0; pL2 = 0; pL3 = 0;
+  pedalConflict = 0;
+  totalRisk = 0;
+  riskLevel = 0;
+  riskAvailable = 0;
+  candidateLevel = 0;
+  prevCandidateLevel = 0;
+  candidateCount = 0;
+  envTtc = 0;
+  envTtcValid = 0;
+}
+
+void publishState()
+{
+  if (envTtcValid) @Safety::TTC = minF(envTtc, 99.9);
+  else             @Safety::TTC = 99.9;               // TTC None
+  @Safety::BNS       = bnsScore;
+  @Safety::PMS       = pmsScore;
+  @Safety::TotalRisk = totalRisk;
+  @Safety::RiskOut   = riskLevel;
+  @Safety::RiskAvailable = riskAvailable;
+  @Safety::Candidate = candidateLevel;
+  @Safety::CondL1 = dL1 + tL1 + pL1;
+  @Safety::CondL2 = dL2 + tL2 + pL2;
+  @Safety::CondL3 = dL3 + tL3 + pL3;
+  @Safety::CondDist  = dL1 + dL2 * 2 + dL3 * 4;
+  @Safety::CondTtc   = tL1 + tL2 * 2 + tL3 * 4;
+  @Safety::CondPedal = pL1 + pL2 * 2 + pL3 * 4;
+  @Safety::PedalConflict  = pedalConflict;
+  @Safety::FailSafe       = failsafeActive;
+  @Safety::FailSafeReason = failsafeReason;
+  @Safety::PedalTimeout   = !pedalConnected;
+  @Safety::HapStsTimeout  = !hapticConnected;
+}
+
+// ============================================================================
+// Command transmission (10 ms)
+// ============================================================================
+on timer tTx
+{
+  float tNow;
+  byte  vib;
+  byte  inten;
+  byte  freq;
+  byte  mode;
+  byte  limit;
+  byte  flags;
+  int   motFresh;
+  int   estopActive;
+  int   otherFault;
+  int   safeToRecover;
+  float dtMot;
+
+  setTimer(tTx, CMD_TX_PERIOD_MS);
+  tNow = nowMs();
+
+  // ---- command_mapper.map() ----
+  if (failsafeActive)
+  {
+    vib = 0; inten = 0; freq = 0;
+    mode = MODE_STOP; limit = 0; flags = FLAG_VALID | FLAG_ESTOP;
+  }
+  else if (!riskAvailable)
+  {
+    vib = 0; inten = 0; freq = 0;
+    mode = MODE_NORMAL; limit = 100; flags = FLAG_VALID;
+  }
+  else
+  {
+    vib   = mapVibCmd[riskLevel];
+    inten = mapIntensity[riskLevel];
+    freq  = mapFrequency[riskLevel];
+    mode  = mapCtrlMode[riskLevel];
+    limit = mapOutLimit[riskLevel];
+    flags = FLAG_VALID;
+  }
+
+  // ---- Motor ECU communication / E-STOP recovery (main.py) ----
+  dtMot = tNow - motLastRxTime;
+  motFresh = motStatusReceived && (dtMot >= 0) && (dtMot <= MOTOR_STATUS_FRESH_MS);
+
+  if (!motFresh)
+  {
+    motRecoveryRequired = 1;
+    mode = MODE_STOP; limit = 0; flags = FLAG_VALID | FLAG_ESTOP;
+  }
+  else
+  {
+    estopActive = ((motFaultFlags & 0x08) != 0);
+    otherFault  = ((motFaultFlags & 0x07) != 0);
+    safeToRecover = (!failsafeActive) && pedalConnected && (sensorStatus == 0)
+                    && (accel <= RECOVERY_ACCEL_MAX_PERCENT)
+                    && (brake < RECOVERY_BRAKE_MAX_PERCENT)
+                    && (!otherFault);
+
+    if (failsafeActive)
+    {
+      motRecoveryRequired = 1;
+    }
+    else if (estopActive)
+    {
+      motRecoveryRequired = 1;
+      if (safeToRecover)
+      {
+        mode = MODE_STOP; limit = 0; flags = FLAG_VALID;   // clear E-STOP, keep STOP
+      }
+    }
+    else if (motRecoveryRequired)
+    {
+      if (safeToRecover && (motState == 0) && (motPwm == 0))
+      {
+        motRecoveryRequired = 0;
+        write("Safety: Motor E-STOP recovery confirmed");
+      }
+      mode = MODE_STOP; limit = 0; flags = FLAG_VALID;     // keep STOP this cycle
+    }
+  }
+
+  @Safety::MotStsTimeout  = !motFresh;
+  @Safety::MotorRecovery  = motRecoveryRequired;
+  @Safety::CtrlModeOut    = mode;
+  @Safety::OutLimitOut    = limit;
+  @Safety::CmdFlagsOut    = flags;
+
+  sendHapticCommand(riskLevel, vib, inten, freq);
+  sendMotorCommand(riskLevel, mode, limit, flags);
+
+  // Alive counters advance every cycle (TEST hooks can freeze them)
+  if (@Safety::HapCmdAliveFault == 0) hapCnt = nextCnt(hapCnt);
+  if (@Safety::MotCmdAliveFault == 0) motCnt = nextCnt(motCnt);
+}
+
+// 0x110: Byte0 risk, Byte1 vib, Byte2 intensity, Byte3 frequency, Byte4..6 0, Byte7 alive
+void sendHapticCommand(long risk, byte vib, byte inten, byte freq)
+{
+  if (@Safety::TxStop_HapCmd == 1) return;
+
+  mHapCmd.dlc = 8;
+  mHapCmd.byte(0) = risk;
+  mHapCmd.byte(1) = vib;
+  mHapCmd.byte(2) = inten;
+  mHapCmd.byte(3) = freq;
+  if (@Safety::HapCmdInvalid == 1)
+  {
+    // TEST: ON command with intensity 0 (rejected by the Haptic ECU)
+    mHapCmd.byte(1) = 1;
+    mHapCmd.byte(2) = 0;
+    mHapCmd.byte(3) = 20;
+  }
+  mHapCmd.byte(4) = 0;
+  mHapCmd.byte(5) = 0;
+  mHapCmd.byte(6) = 0;
+  mHapCmd.byte(7) = hapCnt;
+  output(mHapCmd);
+}
+
+// 0x120: Byte0 mode, Byte1 limit, Byte2 risk, Byte3 flags, Byte4..6 0, Byte7 alive
+void sendMotorCommand(long risk, byte mode, byte limit, byte flags)
+{
+  if (@Safety::TxStop_MotCmd == 1) return;
+
+  mMotCmd.dlc = 8;
+  mMotCmd.byte(0) = mode;
+  mMotCmd.byte(1) = limit;
+  mMotCmd.byte(2) = risk;
+  mMotCmd.byte(3) = flags;
+  if (@Safety::Dbg_CmdInvalid == 1) mMotCmd.byte(3) = flags & 0xFE;   // TEST: Command Valid = 0
+  mMotCmd.byte(4) = 0;
+  mMotCmd.byte(5) = 0;
+  mMotCmd.byte(6) = 0;
+  mMotCmd.byte(7) = motCnt;
+  output(mMotCmd);
+}
+
+// ============================================================================
+// Simulation reset (Panel RESET button): obstacle placed again, risk state cleared
+// Pedal.can clears the pedal inputs and all fault injections on the same event
+// ============================================================================
 on sysvar_update Safety::ObstacleReset
 {
   if (@Safety::ObstacleReset != 1) return;
 
-  // Driver inputs
-  @Pedal::AccelPedal = 0;
-  @Pedal::BrakePedal = 0;
-
-  // Fault injections and test hooks
-  @Pedal::Err_AccelAdc   = 0;
-  @Pedal::Err_BrakeAdc   = 0;
-  @Pedal::Err_AccelDisc  = 0;
-  @Pedal::Err_BrakeDisc  = 0;
-  @Pedal::Err_AccelCal   = 0;
-  @Pedal::Err_BrakeCal   = 0;
-  @Pedal::TxStop         = 0;
-  @Pedal::AccelRateOvrEn = 0;
-  @Pedal::BrakeRateOvrEn = 0;
-  @Safety::TxStop_HapCmd = 0;
-  @Safety::TxStop_MotCmd = 0;
-  @Safety::Dbg_CmdInvalid = 0;
-  @Safety::EStopReq      = 0;
-  @Haptic::TxStop        = 0;
-  @Haptic::FaultInject   = 0;
-  @Motor::TxStop             = 0;
-  @Motor::DriverFaultInject  = 0;
-  @Motor::SpeedInvalidInject = 0;
-  @Motor::SpeedOvrEn         = 0;
-
-  // Risk mode and state
-  @Safety::AutoRisk  = 1;
-  @Safety::RiskLevel = 0;
   obsDist = @Safety::ObstacleInitDist;
   @Safety::ToFDistance = obsDist;
   @Safety::Collision = 0;
-  autoEStop = 0;
-  misapplied = 0;
-  pms = 0;
-  riskOut = 0;
-  riskLowSince = nowMs();
-
+  @Safety::AutoRisk  = 1;
+  @Safety::RiskLevel = 0;
+  @Safety::PedalAliveDupCnt  = 0;
+  @Safety::PedalAliveBackCnt = 0;
+  @Safety::PedalAliveSkipCnt = 0;
+  resetRiskState();
   write("Safety: simulation reset, obstacle at %.1f m", obsDist);
-}
-
-void sendHapticCommand(long risk)
-{
-  if (@Safety::TxStop_HapCmd == 1) return;
-
-  mHapCmd.HapCmd_RiskLevel = risk;
-  if (mapVibCmd[risk] == 1)
-  {
-    mHapCmd.HapCmd_VibCmd    = 1;
-    mHapCmd.HapCmd_Intensity = mapIntensity[risk];
-    mHapCmd.HapCmd_Frequency = mapFrequency[risk];
-  }
-  else
-  {
-    // OFF rule: command, intensity and frequency are all zero
-    mHapCmd.HapCmd_VibCmd    = 0;
-    mHapCmd.HapCmd_Intensity = 0;
-    mHapCmd.HapCmd_Frequency = 0;
-  }
-  mHapCmd.HapCmd_AliveCnt = hapCnt;
-  output(mHapCmd);
-  hapCnt = nextCnt(hapCnt);
-}
-
-void sendMotorCommand(long risk, int ctrlMode, long outLimit, int estop)
-{
-  if (@Safety::TxStop_MotCmd == 1) return;
-
-  mMotCmd.MotCmd_ControlMode = ctrlMode;
-  mMotCmd.MotCmd_OutputLimit = outLimit;
-  mMotCmd.MotCmd_RiskLevel   = risk;
-  if (@Safety::Dbg_CmdInvalid == 1)
-    mMotCmd.MotCmd_CmdValid = 0;   // test hook: send an invalid command
-  else
-    mMotCmd.MotCmd_CmdValid = 1;
-  mMotCmd.MotCmd_EStop    = estop;
-  mMotCmd.MotCmd_AliveCnt = motCnt;
-  output(mMotCmd);
-  motCnt = nextCnt(motCnt);
-}
-
-// vehicle_speed source selection: ACTUAL -> MOTOR_STATUS, CARLA -> sysvar
-void updateVehicleSpeed(int motStsTo)
-{
-  if (activeMode == MODE_CARLA)
-  {
-    @Safety::VehicleSpeed = @Safety::CarlaSpeed * 3.6;   // m/s -> km/h
-    @Safety::SpeedValid   = 1;
-    return;
-  }
-  if (motStsTo || (motSpeedRaw == 0xFFFF))
-  {
-    @Safety::VehicleSpeed = 0;
-    @Safety::SpeedValid   = 0;   // 0xFFFF (invalid) is never treated as 0.00 m/s
-    return;
-  }
-  @Safety::VehicleSpeed = motSpeedPhys * 3.6;   // CAN m/s -> display km/h
-  @Safety::SpeedValid   = 1;
-}
-
-int isVehicleStopped()
-{
-  return (pdlAccel == 0) && (@Safety::VehicleSpeed < 0.18);
-}
-
-// Mode change is accepted only while the vehicle is stopped
-on sysvar_update Safety::OpMode
-{
-  long req;
-  req = @Safety::OpMode;
-  if (req == activeMode) return;
-
-  if (isVehicleStopped())
-  {
-    activeMode = req;
-    lastMotStsRx = nowMs();   // restart MOTOR_STATUS monitoring after a mode change
-    write("Safety: operating mode -> %d (0=ACTUAL, 1=CARLA)", req);
-  }
-  else
-  {
-    @Safety::ModeChangeRejected = @Safety::ModeChangeRejected + 1;
-    @Safety::OpMode = activeMode;   // revert the request
-    write("Safety: mode change rejected while driving");
-  }
-}
-
-
-// ============================================================
-// Keyboard shortcuts for demos (CANoe window focused, measurement running)
-// '1'..'9' toggle Fail-Safe injections, '0' clear all, 'p' toggle PACE risk judgment
-// ============================================================
-void toggleFs(int n)
-{
-  long v;
-  if (n == 1) { v = !@Pedal::TxStop;             @Pedal::TxStop = v; }
-  if (n == 2) { v = !@Safety::TxStop_HapCmd;     @Safety::TxStop_HapCmd = v; }
-  if (n == 3) { v = !@Safety::TxStop_MotCmd;     @Safety::TxStop_MotCmd = v; }
-  if (n == 4) { v = !@Haptic::TxStop;            @Haptic::TxStop = v; }
-  if (n == 5) { v = !@Motor::TxStop;             @Motor::TxStop = v; }
-  if (n == 6) { v = !@Motor::SpeedInvalidInject; @Motor::SpeedInvalidInject = v; }
-  if (n == 7) { v = !@Safety::Dbg_CmdInvalid;    @Safety::Dbg_CmdInvalid = v; }
-  if (n == 8) { v = !@Pedal::Err_AccelAdc;       @Pedal::Err_AccelAdc = v; }
-  if (n == 9) { if (@Haptic::FaultInject == 0) v = 1; else v = 0; @Haptic::FaultInject = v; }
-  if (v) write("FS%d ON", n);
-  else   write("FS%d OFF", n);
-}
-
-void clearFs()
-{
-  @Pedal::TxStop = 0;
-  @Safety::TxStop_HapCmd = 0;
-  @Safety::TxStop_MotCmd = 0;
-  @Haptic::TxStop = 0;
-  @Motor::TxStop = 0;
-  @Motor::SpeedInvalidInject = 0;
-  @Safety::Dbg_CmdInvalid = 0;
-  @Pedal::Err_AccelAdc = 0;
-  @Haptic::FaultInject = 0;
-  write("FS all OFF");
-}
-
-on key '1' { toggleFs(1); }
-on key '2' { toggleFs(2); }
-on key '3' { toggleFs(3); }
-on key '4' { toggleFs(4); }
-on key '5' { toggleFs(5); }
-on key '6' { toggleFs(6); }
-on key '7' { toggleFs(7); }
-on key '8' { toggleFs(8); }
-on key '9' { toggleFs(9); }
-on key '0' { clearFs(); }
-
-on key 'p'
-{
-  if (@Safety::AutoRisk == 1)
-  {
-    @Safety::AutoRisk = 0;
-    @Safety::RiskLevel = 0;
-    write("PACE OFF (risk judgment disabled)");
-  }
-  else
-  {
-    @Safety::AutoRisk = 1;
-    write("PACE ON");
-  }
 }
 
 // ---- Common helpers ----
@@ -516,13 +829,6 @@ float nowMs()
   return timeNow() / 100.0;
 }
 
-// Round half away from zero
-long roundL(float x)
-{
-  if (x >= 0) return (long)(x + 0.5);
-  return (long)(x - 0.5);
-}
-
 long clampL(long x, long lo, long hi)
 {
   if (x < lo) return lo;
@@ -530,7 +836,20 @@ long clampL(long x, long lo, long hi)
   return x;
 }
 
-long minL(long a, long b)
+float clampF(float x, float lo, float hi)
+{
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+float maxF(float a, float b)
+{
+  if (a > b) return a;
+  return b;
+}
+
+float minF(float a, float b)
 {
   if (a < b) return a;
   return b;

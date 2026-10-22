@@ -1,0 +1,474 @@
+﻿/*@!Encoding:65001*/
+// ============================================================================
+// PACE CANoe test module (Simulated Bus, all four CAPL nodes active)
+// TC01..TC08 + EDGE : reference vectors generated from the real Safety ECU Python
+//                     code (tools/risk_reference.py -> PACE_RefVectors.cin)
+// TC05             : stepwise descent L3 -> L2 -> L1 -> L0
+// TC09..TC14       : communication faults, Alive Counter, DLC, recovery
+// ============================================================================
+
+includes
+{
+  #include "PACE_RefVectors.cin"
+}
+
+variables
+{
+  const long  HOLD_MS     = 100;     // hold time per reference vector (>= 30 evaluations after the CAN update)
+  const float SCORE_TOL   = 0.0001;
+
+  message HAPTIC_COMMAND gHapCmd;
+  message MOTOR_COMMAND  gMotCmd;
+  message HAPTIC_STATUS  gHapSts;
+  message MOTOR_STATUS   gMotSts;
+
+  long gFail;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+void resetSimulation()
+{
+  @Safety::ObstacleReset = 1;
+  TestWaitForTimeout(20);
+  @Safety::ObstacleReset = 0;
+  @Pedal::OneFoot = 0;              // send both pedals as entered
+  @Pedal::AccelRateOvrEn = 1;       // exact accelerator rate from the vector
+  @Pedal::AccelRateOvr = 0;
+  @Pedal::AccelPedal = 0;
+  @Pedal::BrakePedal = 0;
+  @Safety::EnvOvrEn = 1;
+  @Safety::ObstaclePresent = 1;
+  @Safety::EnvOvrDist = 40;
+  @Safety::EnvOvrSpeedKmh = 0;
+  @Safety::EnvOvrClosing = 0;
+  @Safety::EnvOvrTtc = -1;
+  TestWaitForTimeout(400);          // pedal recovery + motor E-STOP recovery with released pedals
+}
+
+void applyVector(long i)
+{
+  @Safety::ObstaclePresent = refPresent[i];
+  @Safety::EnvOvrDist      = refDist[i];
+  @Safety::EnvOvrSpeedKmh  = refSpeed[i];
+  @Safety::EnvOvrClosing   = refClosing[i];
+  @Safety::EnvOvrTtc       = refTtc[i];
+  @Pedal::AccelRateOvr     = refRate[i];
+  @Pedal::AccelPedal       = refAccel[i];
+  @Pedal::BrakePedal       = refBrake[i];
+}
+
+int readHapticCommand()
+{
+  if (TestWaitForMessage(HAPTIC_COMMAND, 30) != 1) return 0;
+  TestGetWaitEventMsgData(gHapCmd);
+  return 1;
+}
+
+int readMotorCommand()
+{
+  if (TestWaitForMessage(MOTOR_COMMAND, 30) != 1) return 0;
+  TestGetWaitEventMsgData(gMotCmd);
+  return 1;
+}
+
+int readHapticStatus()
+{
+  if (TestWaitForMessage(HAPTIC_STATUS, 30) != 1) return 0;
+  TestGetWaitEventMsgData(gHapSts);
+  return 1;
+}
+
+int readMotorStatus()
+{
+  if (TestWaitForMessage(MOTOR_STATUS, 30) != 1) return 0;
+  TestGetWaitEventMsgData(gMotSts);
+  return 1;
+}
+
+void checkStep(char step[], int ok, char text[])
+{
+  if (ok) TestStepPass(step, "%s", text);
+  else
+  {
+    TestStepFail(step, "%s", text);
+    gFail = gFail + 1;
+  }
+}
+
+float absF(float x)
+{
+  if (x < 0) return -x;
+  return x;
+}
+
+// Wait until a system variable reaches a value; returns elapsed ms or -1
+float waitSysvarValue(long target, long timeoutMs, char which[])
+{
+  float t0;
+  long  v;
+  t0 = timeNow() / 100.0;
+  while (((timeNow() / 100.0) - t0) <= timeoutMs)
+  {
+    if (strncmp(which, "FailSafe", 8) == 0)        v = @Safety::FailSafe;
+    else if (strncmp(which, "RiskOut", 7) == 0)    v = @Safety::RiskOut;
+    else if (strncmp(which, "Recovery", 8) == 0)   v = @Safety::MotorRecovery;
+    else                                            v = -999;
+    if (v == target) return (timeNow() / 100.0) - t0;
+    TestWaitForTimeout(1);
+  }
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// TC01..TC08, EDGE: CANoe Safety node vs real Safety ECU Python (same inputs)
+// ---------------------------------------------------------------------------
+testcase TC_RefVectors()
+{
+  long i;
+  char step[16];
+  char txt[300];
+  int  ok;
+
+  TestCaseTitle("TC01-TC08", "Reference vectors: CANoe Safety node vs safety_ecu Python (risk level, scores, 0x110, 0x120)");
+  resetSimulation();
+
+  for (i = 0; i < REF_COUNT; i++)
+  {
+    applyVector(i);
+    TestWaitForTimeout(HOLD_MS);
+    snprintf(step, elcount(step), "V%02d", i + 1);
+
+    ok = (@Safety::RiskOut == refLevel[i]);
+    snprintf(txt, elcount(txt), "Risk level CANoe L%d / Python L%d", @Safety::RiskOut, refLevel[i]);
+    checkStep(step, ok, txt);
+
+    ok = (absF(@Safety::BNS - refBns[i]) < SCORE_TOL) && (absF(@Safety::PMS - refPms[i]) < SCORE_TOL)
+         && (absF(@Safety::TotalRisk - refTotal[i]) < SCORE_TOL);
+    snprintf(txt, elcount(txt), "BNS %.4f/%.4f PMS %.4f/%.4f Total %.4f/%.4f (CANoe/Python)",
+             @Safety::BNS, refBns[i], @Safety::PMS, refPms[i], @Safety::TotalRisk, refTotal[i]);
+    checkStep(step, ok, txt);
+
+    if (readHapticCommand())
+    {
+      ok = (gHapCmd.byte(0) == refLevel[i]) && (gHapCmd.byte(1) == refVib[i])
+           && (gHapCmd.byte(2) == refIntensity[i]) && (gHapCmd.byte(3) == refFrequency[i]);
+      snprintf(txt, elcount(txt), "0x110 %02X %02X %02X %02X / expected %02X %02X %02X %02X",
+               gHapCmd.byte(0), gHapCmd.byte(1), gHapCmd.byte(2), gHapCmd.byte(3),
+               refLevel[i], refVib[i], refIntensity[i], refFrequency[i]);
+      checkStep(step, ok, txt);
+    }
+    else checkStep(step, 0, "0x110 not received");
+
+    if (readMotorCommand())
+    {
+      ok = (gMotCmd.byte(0) == refMode[i]) && (gMotCmd.byte(1) == refLimit[i])
+           && (gMotCmd.byte(2) == refLevel[i]) && (gMotCmd.byte(3) == refFlags[i]);
+      snprintf(txt, elcount(txt), "0x120 %02X %02X %02X %02X / expected %02X %02X %02X %02X",
+               gMotCmd.byte(0), gMotCmd.byte(1), gMotCmd.byte(2), gMotCmd.byte(3),
+               refMode[i], refLimit[i], refLevel[i], refFlags[i]);
+      checkStep(step, ok, txt);
+    }
+    else checkStep(step, 0, "0x120 not received");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TC05: release from L3 -> one level per 5 evaluations
+// ---------------------------------------------------------------------------
+testcase TC05_StepDown()
+{
+  long seq[8];
+  long n;
+  long last;
+  long k;
+  char txt[200];
+
+  TestCaseTitle("TC05", "Risk release: L3 -> L2 -> L1 -> L0 one level at a time");
+  resetSimulation();
+
+  applyVector(3);                      // V04: L3
+  TestWaitForTimeout(HOLD_MS);
+  checkStep("TC05-1", @Safety::RiskOut == 3, "L3 reached");
+
+  applyVector(4);                      // V05: release
+  n = 0;
+  last = @Safety::RiskOut;
+  seq[n] = last; n++;
+  for (k = 0; k < 150; k++)
+  {
+    TestWaitForTimeout(1);
+    if ((@Safety::RiskOut != last) && (n < 8))
+    {
+      last = @Safety::RiskOut;
+      seq[n] = last; n++;
+    }
+  }
+  snprintf(txt, elcount(txt), "observed %d levels: L%d L%d L%d L%d", n, seq[0], seq[1], seq[2], seq[3]);
+  checkStep("TC05-2", (n == 4) && (seq[0] == 3) && (seq[1] == 2) && (seq[2] == 1) && (seq[3] == 0), txt);
+}
+
+// ---------------------------------------------------------------------------
+// TC09: PEDAL_STATUS timeout -> Safety Fail-Safe (Stop 0 % + E-STOP)
+// ---------------------------------------------------------------------------
+testcase TC09_PedalTimeout()
+{
+  float tDetect;
+  char  txt[200];
+
+  TestCaseTitle("TC09", "PEDAL_STATUS stop: Safety Fail-Safe within 100 ms, Motor PEDAL_TIMEOUT after 200 ms");
+  resetSimulation();
+  applyVector(1);                      // L1 driving
+  TestWaitForTimeout(HOLD_MS);
+
+  @Pedal::TxStop = 1;
+  tDetect = waitSysvarValue(1, 300, "FailSafe");
+  snprintf(txt, elcount(txt), "Fail-Safe after %.1f ms (expected about 100 ms), reason %d", tDetect, @Safety::FailSafeReason);
+  checkStep("TC09-1", (tDetect > 80) && (tDetect < 130) && (@Safety::FailSafeReason == 2), txt);
+
+  TestWaitForTimeout(20);
+  if (readMotorCommand())
+  {
+    snprintf(txt, elcount(txt), "0x120 mode %d limit %d flags 0x%02X (expected 2 / 0 / 0x03)", gMotCmd.byte(0), gMotCmd.byte(1), gMotCmd.byte(3));
+    checkStep("TC09-2", (gMotCmd.byte(0) == 2) && (gMotCmd.byte(1) == 0) && (gMotCmd.byte(3) == 0x03), txt);
+  }
+  if (readHapticCommand())
+  {
+    checkStep("TC09-3", gHapCmd.byte(1) == 0, "0x110 vibration OFF");
+  }
+
+  TestWaitForTimeout(250);
+  if (readMotorStatus())
+  {
+    snprintf(txt, elcount(txt), "0x210 state %d PWM %d fault 0x%02X (expected Fault, 0, PEDAL_TIMEOUT|ESTOP)", gMotSts.byte(4), gMotSts.byte(0), gMotSts.byte(5));
+    checkStep("TC09-4", (gMotSts.byte(4) == 3) && (gMotSts.byte(0) == 0) && ((gMotSts.byte(5) & 0x0A) == 0x0A), txt);
+  }
+  @Pedal::TxStop = 0;
+}
+
+// ---------------------------------------------------------------------------
+// TC10: HAPTIC_COMMAND Alive duplicate / invalid command
+// ---------------------------------------------------------------------------
+testcase TC10_HapticCommandFault()
+{
+  char txt[200];
+
+  TestCaseTitle("TC10", "HAPTIC_COMMAND Alive duplicate and invalid command: vibration OFF, timeout not refreshed");
+  resetSimulation();
+  applyVector(1);                      // L1: vibration ON
+  TestWaitForTimeout(HOLD_MS);
+  if (readHapticStatus()) checkStep("TC10-1", gHapSts.byte(1) == 1, "vibration ON before the fault");
+
+  @Safety::HapCmdAliveFault = 1;
+  TestWaitForTimeout(40);
+  if (readHapticStatus())
+  {
+    snprintf(txt, elcount(txt), "FaultCode %d VibStatus %d (expected 4 COMMUNICATION, 0)", gHapSts.byte(4), gHapSts.byte(1));
+    checkStep("TC10-2", (gHapSts.byte(4) == 4) && (gHapSts.byte(1) == 0), txt);
+  }
+  TestWaitForTimeout(100);
+  if (readHapticStatus())
+  {
+    snprintf(txt, elcount(txt), "CmdTimeout %d (expected 1: duplicates do not refresh the 100 ms timeout)", gHapSts.byte(5));
+    checkStep("TC10-3", gHapSts.byte(5) == 1, txt);
+  }
+
+  @Safety::HapCmdAliveFault = 0;
+  TestWaitForTimeout(40);
+  if (readHapticStatus())
+  {
+    snprintf(txt, elcount(txt), "after recovery FaultCode %d CmdTimeout %d VibStatus %d (expected 0, 0, 1)", gHapSts.byte(4), gHapSts.byte(5), gHapSts.byte(1));
+    checkStep("TC10-4", (gHapSts.byte(4) == 0) && (gHapSts.byte(5) == 0) && (gHapSts.byte(1) == 1), txt);
+  }
+
+  @Safety::HapCmdInvalid = 1;
+  TestWaitForTimeout(40);
+  if (readHapticStatus())
+  {
+    snprintf(txt, elcount(txt), "invalid command FaultCode %d VibStatus %d (expected 3 INVALID_COMMAND, 0)", gHapSts.byte(4), gHapSts.byte(1));
+    checkStep("TC10-5", (gHapSts.byte(4) == 3) && (gHapSts.byte(1) == 0), txt);
+  }
+  TestWaitForTimeout(100);
+  if (readHapticStatus()) checkStep("TC10-6", gHapSts.byte(5) == 1, "invalid commands do not refresh the timeout");
+  @Safety::HapCmdInvalid = 0;
+  TestWaitForTimeout(40);
+  if (readHapticStatus()) checkStep("TC10-7", (gHapSts.byte(4) == 0) && (gHapSts.byte(5) == 0), "fault cleared by a valid command");
+}
+
+// ---------------------------------------------------------------------------
+// TC11: MOTOR_COMMAND timeout / invalid -> Motor safe output
+// ---------------------------------------------------------------------------
+testcase TC11_MotorCommandTimeout()
+{
+  char  txt[200];
+  long  k;
+  float t0;
+  float tDetect;
+
+  TestCaseTitle("TC11", "MOTOR_COMMAND stop or Command Valid = 0: Motor COMMAND_TIMEOUT after 200 ms, output 0");
+  resetSimulation();
+  @Safety::EnvOvrDist = 40;
+  @Pedal::AccelPedal = 30;             // driving in NORMAL
+  TestWaitForTimeout(300);
+  if (readMotorStatus()) checkStep("TC11-1", gMotSts.byte(4) == 1, "Motor RUNNING before the fault");
+
+  @Safety::TxStop_MotCmd = 1;
+  t0 = timeNow() / 100.0;
+  tDetect = -1;
+  for (k = 0; k < 40; k++)
+  {
+    if (readMotorStatus())
+    {
+      if ((gMotSts.byte(5) & 0x04) != 0) { tDetect = (timeNow() / 100.0) - t0; break; }
+    }
+  }
+  snprintf(txt, elcount(txt), "COMMAND_TIMEOUT after %.1f ms (expected about 200..210 ms)", tDetect);
+  checkStep("TC11-2", (tDetect > 180) && (tDetect < 230), txt);
+  if (readMotorStatus())
+  {
+    snprintf(txt, elcount(txt), "state %d PWM %d limit %d (expected Fault, 0, 0)", gMotSts.byte(4), gMotSts.byte(0), gMotSts.byte(1));
+    checkStep("TC11-3", (gMotSts.byte(4) == 3) && (gMotSts.byte(0) == 0) && (gMotSts.byte(1) == 0), txt);
+  }
+  @Safety::TxStop_MotCmd = 0;
+  @Pedal::AccelPedal = 0;
+  TestWaitForTimeout(400);
+
+  @Pedal::AccelPedal = 30;
+  TestWaitForTimeout(300);
+  @Safety::Dbg_CmdInvalid = 1;
+  TestWaitForTimeout(260);
+  if (readMotorStatus())
+  {
+    snprintf(txt, elcount(txt), "Valid=0 frames ignored: fault 0x%02X state %d (expected COMMAND_TIMEOUT, Fault)", gMotSts.byte(5), gMotSts.byte(4));
+    checkStep("TC11-4", ((gMotSts.byte(5) & 0x04) != 0) && (gMotSts.byte(4) == 3), txt);
+  }
+  @Safety::Dbg_CmdInvalid = 0;
+  @Pedal::AccelPedal = 0;
+}
+
+// ---------------------------------------------------------------------------
+// TC12: PEDAL_STATUS Alive Counter duplicate / backward
+// ---------------------------------------------------------------------------
+testcase TC12_PedalAliveFault()
+{
+  char  txt[200];
+  float tDetect;
+
+  TestCaseTitle("TC12", "PEDAL_STATUS Alive duplicate / backward: frames rejected by Safety, Fail-Safe after 100 ms");
+  resetSimulation();
+  applyVector(0);
+  TestWaitForTimeout(HOLD_MS);
+
+  @Pedal::AliveFault = 1;
+  tDetect = waitSysvarValue(1, 300, "FailSafe");
+  snprintf(txt, elcount(txt), "duplicate: Fail-Safe after %.1f ms, rejected frames %d", tDetect, @Safety::PedalAliveDupCnt);
+  checkStep("TC12-1", (tDetect > 80) && (tDetect < 130) && (@Safety::PedalAliveDupCnt >= 5), txt);
+  TestWaitForTimeout(200);
+  if (readMotorStatus())
+  {
+    snprintf(txt, elcount(txt), "Motor Alive stuck > 200 ms: fault 0x%02X (expected PEDAL_TIMEOUT bit)", gMotSts.byte(5));
+    checkStep("TC12-2", (gMotSts.byte(5) & 0x02) != 0, txt);
+  }
+  @Pedal::AliveFault = 0;
+  TestWaitForTimeout(400);
+
+  @Pedal::AliveFault = 2;
+  tDetect = waitSysvarValue(1, 300, "FailSafe");
+  snprintf(txt, elcount(txt), "backward: Fail-Safe after %.1f ms, rejected frames %d", tDetect, @Safety::PedalAliveBackCnt);
+  checkStep("TC12-3", (tDetect > 80) && (tDetect < 130) && (@Safety::PedalAliveBackCnt >= 5), txt);
+  TestWaitForTimeout(250);
+  if (readMotorStatus())
+  {
+    // Motor firmware checks only "Alive unchanged"; a changing (backward) counter is accepted
+    snprintf(txt, elcount(txt), "Motor with backward Alive: PEDAL_TIMEOUT bit %d (firmware detects only a stuck counter)", (gMotSts.byte(5) & 0x02) != 0);
+    TestStep("TC12-4", "%s", txt);
+  }
+  @Pedal::AliveFault = 0;
+}
+
+// ---------------------------------------------------------------------------
+// TC13: recovery after a communication fault
+// ---------------------------------------------------------------------------
+testcase TC13_Recovery()
+{
+  char  txt[200];
+  long  k;
+  long  normalFrames;
+  float tRec;
+
+  TestCaseTitle("TC13", "Recovery: pedal Alive re-sync, Fail-Safe clear, Motor E-STOP recovery only with released pedals");
+  resetSimulation();
+  @Pedal::AccelPedal = 30;
+  TestWaitForTimeout(200);
+
+  @Pedal::TxStop = 1;                  // Fail-Safe -> E-STOP
+  TestWaitForTimeout(300);
+  checkStep("TC13-1", @Safety::FailSafe == 1, "Fail-Safe active");
+
+  @Pedal::TxStop = 0;                  // communication restored, accelerator still 30 %
+  tRec = waitSysvarValue(0, 200, "FailSafe");
+  snprintf(txt, elcount(txt), "Fail-Safe cleared %.1f ms after the first frame (two consecutive Alive values)", tRec);
+  checkStep("TC13-2", (tRec >= 0) && (tRec < 40), txt);
+
+  // While the accelerator is pressed the motor must stay stopped
+  normalFrames = 0;
+  for (k = 0; k < 30; k++)
+  {
+    if (readMotorCommand())
+    {
+      if (gMotCmd.byte(0) != 2) normalFrames++;
+    }
+  }
+  snprintf(txt, elcount(txt), "accelerator 30 %%: MotorRecovery %d, non-STOP 0x120 frames %d in 300 ms", @Safety::MotorRecovery, normalFrames);
+  TestStep("TC13-3", "%s", txt);   // same policy as main.py (a short non-STOP frame can appear while E-STOP clears)
+  checkStep("TC13-4", @Safety::MotorRecovery == 1, "E-STOP recovery waits while the accelerator is pressed");
+
+  @Pedal::AccelPedal = 0;              // release -> recovery
+  tRec = waitSysvarValue(0, 300, "Recovery");
+  snprintf(txt, elcount(txt), "recovery confirmed %.1f ms after release", tRec);
+  checkStep("TC13-5", tRec >= 0, txt);
+  TestWaitForTimeout(30);
+  if (readMotorCommand())
+  {
+    snprintf(txt, elcount(txt), "0x120 after recovery: mode %d limit %d flags 0x%02X (expected 0 / 100 / 0x01)", gMotCmd.byte(0), gMotCmd.byte(1), gMotCmd.byte(3));
+    checkStep("TC13-6", (gMotCmd.byte(0) == 0) && (gMotCmd.byte(1) == 100) && (gMotCmd.byte(3) == 0x01), txt);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TC14: wrong DLC
+// ---------------------------------------------------------------------------
+testcase TC14_WrongDlc()
+{
+  char  txt[200];
+  float tDetect;
+
+  TestCaseTitle("TC14", "PEDAL_STATUS with DLC 7: rejected by Safety and Motor");
+  resetSimulation();
+  @Pedal::DlcFault = 1;
+  tDetect = waitSysvarValue(1, 300, "FailSafe");
+  snprintf(txt, elcount(txt), "Fail-Safe after %.1f ms", tDetect);
+  checkStep("TC14-1", (tDetect > 80) && (tDetect < 130), txt);
+  TestWaitForTimeout(250);
+  if (readMotorStatus()) checkStep("TC14-2", (gMotSts.byte(5) & 0x02) != 0, "Motor PEDAL_TIMEOUT (DLC 7 frames ignored)");
+  @Pedal::DlcFault = 0;
+}
+
+void MainTest()
+{
+  gFail = 0;
+  TC_RefVectors();
+  TC05_StepDown();
+  TC09_PedalTimeout();
+  TC10_HapticCommandFault();
+  TC11_MotorCommandTimeout();
+  TC12_PedalAliveFault();
+  TC13_Recovery();
+  TC14_WrongDlc();
+
+  @Safety::EnvOvrEn = 0;
+  @Pedal::OneFoot = 1;
+  @Pedal::AccelRateOvrEn = 0;
+  write("PACE_Test finished: %d failed checks", gFail);
+}

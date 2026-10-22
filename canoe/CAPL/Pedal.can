@@ -1,7 +1,15 @@
 ﻿/*@!Encoding:65001*/
+// ============================================================================
 // Pedal ECU simulation node
+// Reference implementation: pedal_ecu/Core/Src/main.c
 // Tx: PEDAL_STATUS (0x100), 10 ms
-// Inputs: sysvars Pedal::* (panel / test module)
+//   Byte0 accelerator %, Byte1 brake %, Byte2..3 accelerator rate (int16 LE, 0.1 %/s),
+//   Byte4..5 brake rate, Byte6 Sensor Status bitmask (0x00 = normal), Byte7 Alive Counter
+// Inputs: sysvars Pedal::* (Panel sliders, press-and-hold pedal buttons, test module)
+//
+// This node also owns the keyboard fault-injection shortcuts and clears all
+// injections on RESET, so they also work when the Safety node is disabled (Real Bus).
+// ============================================================================
 
 includes
 {
@@ -9,8 +17,7 @@ includes
 
 variables
 {
-  const int PACE_CYCLE_MS   = 10;   // all messages are 10 ms cyclic
-  const int PACE_TIMEOUT_MS = 50;   // common reception timeout (5 cycles)
+  const long PEDAL_PERIOD_MS = 10;
 
   message PEDAL_STATUS mPedal;
   msTimer tCycle;
@@ -18,42 +25,30 @@ variables
   byte aliveCnt;
   long prevAccel;
   long prevBrake;
+  int  firstCycle;
 
-  // Press-and-hold pedal buttons (Panel): pressed -> pedal goes down, released -> pedal springs back to 0
-  const float ACCEL_PRESS_RATE   = 40.0;    // accelerator press speed while held [%/s] (0 -> 100 in 2.5 s)
-  const float ACCEL_RELEASE_RATE = 150.0;   // accelerator spring-back speed [%/s]
-  const float BRAKE_PRESS_RATE   = 200.0;   // brake press speed while held [%/s] (0 -> 100 in 0.5 s)
-  const float BRAKE_RELEASE_RATE = 200.0;   // brake spring-back speed [%/s]
-  float accelF;      // pedal position while driven by the button [%]
+  // Press-and-hold pedal buttons (Panel): pressed -> pedal goes down, released -> back to 0
+  const float ACCEL_PRESS_RATE   = 40.0;    // [%/s] (0 -> 100 in 2.5 s)
+  const float ACCEL_RELEASE_RATE = 150.0;   // [%/s]
+  const float BRAKE_PRESS_RATE   = 200.0;   // [%/s] (0 -> 100 in 0.5 s)
+  const float BRAKE_RELEASE_RATE = 200.0;   // [%/s]
+  float accelF;
   float brakeF;
-  int   accelBtn;    // 1 while the button drives the accelerator (held or springing back)
+  int   accelBtn;
   int   brakeBtn;
 }
 
 on start
 {
-  aliveCnt  = 0;
-  prevAccel = clampL(@Pedal::AccelPedal, 0, 100);
-  prevBrake = clampL(@Pedal::BrakePedal, 0, 100);
+  aliveCnt   = 0;
+  prevAccel  = 0;
+  prevBrake  = 0;
+  firstCycle = 1;
   accelF = 0;
   brakeF = 0;
   accelBtn = 0;
   brakeBtn = 0;
-  setTimer(tCycle, PACE_CYCLE_MS);
-}
-
-// Simulation reset (Panel reset button): no rate spike after pedals are forced to 0
-on sysvar_update Safety::ObstacleReset
-{
-  if (@Safety::ObstacleReset != 1) return;
-  prevAccel = 0;
-  prevBrake = 0;
-  accelF = 0;
-  brakeF = 0;
-  accelBtn = 0;
-  brakeBtn = 0;
-  @Pedal::AccelHold = 0;
-  @Pedal::BrakeHold = 0;
+  setTimer(tCycle, PEDAL_PERIOD_MS);
 }
 
 on timer tCycle
@@ -62,55 +57,78 @@ on timer tCycle
   long  brake;
   float accelRate;
   float brakeRate;
+  long  rawA;
+  long  rawB;
+  byte  sensorSt;
 
-  setTimer(tCycle, PACE_CYCLE_MS);   // re-arm first to keep a fixed period
+  setTimer(tCycle, PEDAL_PERIOD_MS);
 
   updatePedalButtons();
 
   accel = clampL(@Pedal::AccelPedal, 0, 100);
   brake = clampL(@Pedal::BrakePedal, 0, 100);
 
-  // Rate of change in %/s from the difference to the previous cycle
-  accelRate = (accel - prevAccel) * 1000.0 / PACE_CYCLE_MS;
-  brakeRate = (brake - prevBrake) * 1000.0 / PACE_CYCLE_MS;
+  // Rate of change [%/s] from the previous 10 ms sample; first sample -> 0
+  if (firstCycle)
+  {
+    accelRate = 0;
+    brakeRate = 0;
+    firstCycle = 0;
+  }
+  else
+  {
+    accelRate = (accel - prevAccel) * 1000.0 / PEDAL_PERIOD_MS;
+    brakeRate = (brake - prevBrake) * 1000.0 / PEDAL_PERIOD_MS;
+  }
   prevAccel = accel;
   prevBrake = brake;
 
-  // Test hooks: replace the computed rate with a fixed value
+  // TEST: fixed rate values
   if (@Pedal::AccelRateOvrEn == 1) accelRate = @Pedal::AccelRateOvr;
   if (@Pedal::BrakeRateOvrEn == 1) brakeRate = @Pedal::BrakeRateOvr;
 
-  // Simulate loss of PEDAL_STATUS (counter is not incremented while silent)
+  // Sensor Status bitmask
+  sensorSt = 0;
+  if (@Pedal::Err_AccelAdc  == 1) sensorSt = sensorSt | 0x01;
+  if (@Pedal::Err_BrakeAdc  == 1) sensorSt = sensorSt | 0x02;
+  if (@Pedal::Err_AccelDisc == 1) sensorSt = sensorSt | 0x04;
+  if (@Pedal::Err_BrakeDisc == 1) sensorSt = sensorSt | 0x08;
+  if (@Pedal::Err_AccelCal  == 1) sensorSt = sensorSt | 0x10;
+  if (@Pedal::Err_BrakeCal  == 1) sensorSt = sensorSt | 0x20;
+
+  // TEST: PEDAL_STATUS not transmitted (Alive Counter not incremented)
   if (@Pedal::TxStop == 1) return;
 
-  mPedal.Pdl_AccelPedal = accel;
-  mPedal.Pdl_BrakePedal = brake;
-  mPedal.Pdl_AccelRate = rateToRaw(accelRate);
-  mPedal.Pdl_BrakeRate = rateToRaw(brakeRate);
+  rawA = clampL(roundL(accelRate / 0.1), -32768, 32767);
+  rawB = clampL(roundL(brakeRate / 0.1), -32768, 32767);
 
-  mPedal.Pdl_Err_AccelAdcRange   = @Pedal::Err_AccelAdc;
-  mPedal.Pdl_Err_BrakeAdcRange   = @Pedal::Err_BrakeAdc;
-  mPedal.Pdl_Err_AccelDisconnect = @Pedal::Err_AccelDisc;
-  mPedal.Pdl_Err_BrakeDisconnect = @Pedal::Err_BrakeDisc;
-  mPedal.Pdl_Err_AccelCalib      = @Pedal::Err_AccelCal;
-  mPedal.Pdl_Err_BrakeCalib      = @Pedal::Err_BrakeCal;
-
-  mPedal.Pdl_AliveCnt = aliveCnt;
+  mPedal.dlc = 8;
+  if (@Pedal::DlcFault == 1) mPedal.dlc = 7;        // TEST: wrong DLC
+  mPedal.byte(0) = accel;
+  mPedal.byte(1) = brake;
+  mPedal.byte(2) = rawA & 0xFF;
+  mPedal.byte(3) = (rawA >> 8) & 0xFF;
+  mPedal.byte(4) = rawB & 0xFF;
+  mPedal.byte(5) = (rawB >> 8) & 0xFF;
+  mPedal.byte(6) = sensorSt;
+  mPedal.byte(7) = aliveCnt;
   output(mPedal);
-  aliveCnt = nextCnt(aliveCnt);
+
+  // Alive Counter: 0 -> 255 -> 0 (TEST: 1 = frozen/duplicate, 2 = backward)
+  if (@Pedal::AliveFault == 0)      aliveCnt = nextCnt(aliveCnt);
+  else if (@Pedal::AliveFault == 2) aliveCnt = prevCnt(aliveCnt);
 }
 
-// Pedal buttons (press-and-hold) and brake priority
+// Press-and-hold pedal buttons and one-foot driving
 // Without the buttons the slider / input box values are used unchanged
 void updatePedalButtons()
 {
   float dt;
-  dt = PACE_CYCLE_MS / 1000.0;
+  dt = PEDAL_PERIOD_MS / 1000.0;
 
-  // Accelerator button
   if (@Pedal::AccelHold == 1)
   {
-    if (accelBtn == 0) accelF = @Pedal::AccelPedal;   // start from the current position
+    if (accelBtn == 0) accelF = @Pedal::AccelPedal;
     accelBtn = 1;
     accelF = accelF + ACCEL_PRESS_RATE * dt;
     if (accelF > 100) accelF = 100;
@@ -123,7 +141,6 @@ void updatePedalButtons()
     @Pedal::AccelPedal = roundL(accelF);
   }
 
-  // Brake button
   if (@Pedal::BrakeHold == 1)
   {
     if (brakeBtn == 0) brakeF = @Pedal::BrakePedal;
@@ -139,33 +156,120 @@ void updatePedalButtons()
     @Pedal::BrakePedal = roundL(brakeF);
   }
 
-  // Brake priority: one foot -> while the brake is pressed the accelerator is 0
-  if (@Pedal::BrakePedal > 0)
+  // Driver model (not firmware): one foot -> accelerator released while braking.
+  // Pedal::OneFoot = 0 sends both pedals as entered (needed for the pedal conflict test).
+  if ((@Pedal::OneFoot == 1) && (@Pedal::BrakePedal > 0))
   {
     if (@Pedal::AccelPedal != 0) @Pedal::AccelPedal = 0;
     accelF = 0;
     accelBtn = 0;
   }
 
-  // Brake lamp for the Panel
   if (@Pedal::BrakePedal > 0) { if (@Pedal::BrakeLamp != 1) @Pedal::BrakeLamp = 1; }
   else                        { if (@Pedal::BrakeLamp != 0) @Pedal::BrakeLamp = 0; }
 }
 
-// %/s -> raw (0.1 %/s per bit), rounded and saturated to int16
-long rateToRaw(float ratePctPerSec)
+// ============================================================================
+// RESET (Panel button): pedals 0 and all fault injections cleared
+// ============================================================================
+on sysvar_update Safety::ObstacleReset
 {
-  return clampL(roundL(ratePctPerSec / 0.1), -32768, 32767);
+  if (@Safety::ObstacleReset != 1) return;
+  @Pedal::AccelPedal = 0;
+  @Pedal::BrakePedal = 0;
+  @Pedal::AccelHold  = 0;
+  @Pedal::BrakeHold  = 0;
+  prevAccel = 0;
+  prevBrake = 0;
+  accelF = 0;
+  brakeF = 0;
+  accelBtn = 0;
+  brakeBtn = 0;
+  clearFaults();
+}
+
+void clearFaults()
+{
+  @Pedal::Err_AccelAdc   = 0;
+  @Pedal::Err_BrakeAdc   = 0;
+  @Pedal::Err_AccelDisc  = 0;
+  @Pedal::Err_BrakeDisc  = 0;
+  @Pedal::Err_AccelCal   = 0;
+  @Pedal::Err_BrakeCal   = 0;
+  @Pedal::TxStop         = 0;
+  @Pedal::AliveFault     = 0;
+  @Pedal::DlcFault       = 0;
+  @Pedal::AccelRateOvrEn = 0;
+  @Pedal::BrakeRateOvrEn = 0;
+  @Safety::TxStop_HapCmd    = 0;
+  @Safety::TxStop_MotCmd    = 0;
+  @Safety::Dbg_CmdInvalid   = 0;
+  @Safety::HapCmdAliveFault = 0;
+  @Safety::HapCmdInvalid    = 0;
+  @Safety::MotCmdAliveFault = 0;
+  @Safety::EnvLink          = 1;
+  @Safety::EnvOvrEn         = 0;
+  @Haptic::TxStop           = 0;
+  @Haptic::FaultInject      = 0;
+  @Motor::TxStop            = 0;
+  @Motor::DriverFaultInject = 0;
+}
+
+// ============================================================================
+// Keyboard fault injection (CANoe window focused, measurement running)
+// ============================================================================
+void showFault(char name[], long isOn)
+{
+  if (isOn) write("FAULT ON : %s", name);
+  else    write("FAULT OFF: %s", name);
+}
+
+on key '1' { @Pedal::TxStop = !@Pedal::TxStop;                   showFault("1 PEDAL_STATUS stop", @Pedal::TxStop); }
+on key '2' { @Safety::TxStop_HapCmd = !@Safety::TxStop_HapCmd;   showFault("2 HAPTIC_COMMAND stop", @Safety::TxStop_HapCmd); }
+on key '3' { @Safety::TxStop_MotCmd = !@Safety::TxStop_MotCmd;   showFault("3 MOTOR_COMMAND stop", @Safety::TxStop_MotCmd); }
+on key '4' { @Haptic::TxStop = !@Haptic::TxStop;                 showFault("4 HAPTIC_STATUS stop", @Haptic::TxStop); }
+on key '5' { @Motor::TxStop = !@Motor::TxStop;                   showFault("5 MOTOR_STATUS stop", @Motor::TxStop); }
+on key '6' { @Safety::EnvLink = !@Safety::EnvLink;               showFault("6 CARLA link lost", !@Safety::EnvLink); }
+on key '7' { @Safety::Dbg_CmdInvalid = !@Safety::Dbg_CmdInvalid; showFault("7 MOTOR_COMMAND Valid=0", @Safety::Dbg_CmdInvalid); }
+on key '8' { @Pedal::Err_AccelAdc = !@Pedal::Err_AccelAdc;       showFault("8 Accel sensor error", @Pedal::Err_AccelAdc); }
+on key '9' { @Haptic::FaultInject = !@Haptic::FaultInject;       showFault("9 Haptic actuator USB disconnect", @Haptic::FaultInject); }
+
+on key 'a'
+{
+  if (@Pedal::AliveFault == 1) @Pedal::AliveFault = 0; else @Pedal::AliveFault = 1;
+  showFault("a PEDAL Alive duplicate", @Pedal::AliveFault == 1);
+}
+on key 'b'
+{
+  if (@Pedal::AliveFault == 2) @Pedal::AliveFault = 0; else @Pedal::AliveFault = 2;
+  showFault("b PEDAL Alive backward", @Pedal::AliveFault == 2);
+}
+on key 'c' { @Safety::HapCmdAliveFault = !@Safety::HapCmdAliveFault; showFault("c HAPTIC_COMMAND Alive duplicate", @Safety::HapCmdAliveFault); }
+on key 'd' { @Safety::HapCmdInvalid = !@Safety::HapCmdInvalid;       showFault("d HAPTIC_COMMAND invalid", @Safety::HapCmdInvalid); }
+on key 'e' { @Safety::MotCmdAliveFault = !@Safety::MotCmdAliveFault; showFault("e MOTOR_COMMAND Alive duplicate", @Safety::MotCmdAliveFault); }
+on key 'f' { @Pedal::DlcFault = !@Pedal::DlcFault;                   showFault("f PEDAL_STATUS DLC 7", @Pedal::DlcFault); }
+
+// Demo pedal keys (Panel without sliders): fixed accelerator positions
+// 'q' = cruise 30 %, 'z' = sudden press 80 % (pedal misapplication), 'x' = release
+on key 'q' { setAccelDirect(30); write("PEDAL: accelerator 30 %%"); }
+on key 'z' { setAccelDirect(80); write("PEDAL: accelerator 80 %% (sudden press)"); }
+on key 'x' { setAccelDirect(0);  write("PEDAL: accelerator released"); }
+
+void setAccelDirect(long pct)
+{
+  accelBtn = 0;
+  accelF = pct;
+  @Pedal::AccelHold = 0;
+  @Pedal::AccelPedal = pct;
+}
+
+on key '0'
+{
+  clearFaults();
+  write("FAULT all OFF");
 }
 
 // ---- Common helpers ----
-// Current measurement time in milliseconds (timeNow() is in 10 us units)
-float nowMs()
-{
-  return timeNow() / 100.0;
-}
-
-// Round half away from zero
 long roundL(float x)
 {
   if (x >= 0) return (long)(x + 0.5);
@@ -179,15 +283,14 @@ long clampL(long x, long lo, long hi)
   return x;
 }
 
-long minL(long a, long b)
-{
-  if (a < b) return a;
-  return b;
-}
-
-// Alive counter: 0 -> 255 -> 0
 byte nextCnt(byte cnt)
 {
   if (cnt >= 255) return 0;
   return cnt + 1;
+}
+
+byte prevCnt(byte cnt)
+{
+  if (cnt == 0) return 255;
+  return cnt - 1;
 }
