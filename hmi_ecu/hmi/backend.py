@@ -11,6 +11,7 @@ QML 에서는 아래만 사용:
 """
 
 import queue
+import threading
 import time
 
 from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot
@@ -71,7 +72,9 @@ class HmiBackend(QObject):
         self._crash_seen_n = None
         self.camera_provider = CameraImageProvider()
         self._cam_pending = None          # 아직 디코딩 안 한 최신 (header, jpeg, t)
-        self._cam = {"fresh": False, "frameId": 0, "w": 0, "h": 0, "mode": "", "view": "front", "overlay": {}, "fps": 0.0, "kb": 0}
+        self._camera_lock = threading.Lock()
+        self._camera_latest = None
+        self._cam = {"fresh": False, "frameId": 0, "w": 0, "h": 0, "mode": "", "overlay": {}, "fps": 0.0, "kb": 0}
         self._cam_t = None
         self._cam_count = 0
         self._cam_status = {"ok": False, "text": "대기"}
@@ -110,6 +113,10 @@ class HmiBackend(QObject):
     # 소스 스레드에서 호출 (thread-safe)
     # ------------------------------------------------------------
     def sink(self, kind, payload, timestamp):
+        if kind == "camera":
+            with self._camera_lock:
+                self._camera_latest = (payload[0], payload[1], timestamp)
+            return
         try:
             self._inbox.put_nowait((kind, payload, timestamp))
         except queue.Full:
@@ -148,9 +155,7 @@ class HmiBackend(QObject):
             col = payload.get("collision")
             if col and col.get("n") != self._collision_n:
                 if self._collision_n is not None or (col.get("age") or 99) < 1.0:
-                    d = col.get("dir") or ""
-                    self._add_event("danger", "CARLA 충돌 감지{}: {}".format(" (" + d + ")" if d else "",
-                                                                         col.get("with", "")))
+                    self._add_event("danger", "CARLA 충돌 감지: " + str(col.get("with", "")))
                 self._collision_n = col.get("n")
         elif kind == "camera":
             self._cam_pending = (payload[0], payload[1], t)    # 최신 것만 남김 (밀린 프레임은 디코딩 안 함)
@@ -183,7 +188,10 @@ class HmiBackend(QObject):
             self._process(kind, payload, t)
 
         now = time.monotonic()
-        self._update_camera(now)
+        with self._camera_lock:
+            if self._camera_latest is not None:
+                self._cam_pending = self._camera_latest
+                self._camera_latest = None
         pedal = self._can_store.get("PEDAL_STATUS")
         if pedal is not None and pedal.get("lat_mark") != pedal["count"]:
             # 페달 프레임 수신 → 화면 상태 반영까지 걸린 시간
@@ -200,6 +208,8 @@ class HmiBackend(QObject):
             carla = self._carla_store["data"]
             state_merge.apply_carla(new_state, carla)
 
+        self._update_camera(now, new_state.get("gear"))
+
         state_merge.apply_carla_ui(new_state, self._carla_ui_store, now)
 
         demo_out = None
@@ -209,8 +219,6 @@ class HmiBackend(QObject):
             fresh_hit = (col.get("age") if col.get("age") is not None else 99) < 1.5
             if fresh_hit and col.get("n") != self._crash_seen_n and self._carla_crash is None:
                 self._carla_crash = col.get("with", "") or "obstacle"      # RESET 전까지 충돌 화면 유지
-                if col.get("dir"):
-                    self._carla_crash = col["dir"] + " · " + self._carla_crash
                 self._add_event("danger", "DEMO 충돌 (CARLA: {}) · RESET 으로 다시 시작".format(self._carla_crash))
             if fresh_hit:
                 self._crash_seen_n = col.get("n")
@@ -285,14 +293,19 @@ class HmiBackend(QObject):
         self._map_parts = {k: v for k, v in self._map_parts.items() if k > ver}
         self.carlaMapChanged.emit()
 
-    def _update_camera(self, now):
+    def _update_camera(self, now, gear):
         cam = self._cam
         changed = False
         if self._cam_pending is not None:
             header, jpeg, t = self._cam_pending
             self._cam_pending = None
-            img = QImage()
-            if img.loadFromData(jpeg, "JPG"):
+            frame_view = header.get("view")
+            if (gear not in ("D", "R") or frame_view == gear
+                    or (gear == "D" and frame_view is None)):
+                img = QImage()
+            else:
+                img = None
+            if img is not None and img.loadFromData(jpeg, "JPG"):
                 self.camera_provider.image = img
                 self._cam_t = t
                 self._cam_count += 1
@@ -301,12 +314,14 @@ class HmiBackend(QObject):
                     "frameId": cam["frameId"] + 1,
                     "w": img.width(), "h": img.height(),
                     "mode": header.get("mode", ""),
-                    "view": header.get("view", "front"),
+                    "view": header.get("view"),
                     "overlay": header.get("overlay") or {},
                     "kb": len(jpeg) // 1024,
                 })
                 changed = True
-        fresh = self._cam_t is not None and now - self._cam_t < config.CAMERA_TIMEOUT
+        fresh = (self._cam_t is not None and now - self._cam_t < config.CAMERA_TIMEOUT
+                 and (gear not in ("D", "R") or cam.get("view") == gear
+                      or (gear == "D" and cam.get("view") is None)))
         if fresh != cam["fresh"]:
             cam = dict(cam)
             cam["fresh"] = fresh

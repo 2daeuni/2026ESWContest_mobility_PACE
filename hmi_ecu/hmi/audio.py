@@ -102,6 +102,9 @@ def generate_sounds(directory=ASSET_DIR, force=False):
 def choose_pattern(s):
     if s.get("demo_collided") or s.get("carla_collision"):
         return "collision"
+    if (not s.get("failsafe_active") and s.get("normal_braking")
+            and s.get("risk_cause") == "RECOVERING"):
+        return None
     level = s.get("risk_level")
     if s.get("brake_now") or level == 3:
         return "danger"
@@ -121,6 +124,7 @@ class _Player:
         self.directory = directory
         self.backend = "none"
         self.effects = {}
+        self.process = None
         try:
             from PySide6.QtCore import QUrl
             from PySide6.QtMultimedia import QSoundEffect
@@ -154,11 +158,22 @@ class _Player:
         if self.backend == "aplay":
             path = os.path.join(self.directory, PATTERNS[key][0])
             try:
-                subprocess.Popen(["aplay", "-q", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.stop()
+                self.process = subprocess.Popen(
+                    ["aplay", "-q", path], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
             except OSError:
                 pass
 
     def stop(self):
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=0.02)
+                except subprocess.TimeoutExpired:
+                    pass
+            self.process = None
         for eff in self.effects.values():
             try:
                 eff.stop()
@@ -193,7 +208,7 @@ class AlertSound:
         if key != self.current:
             self.current = key
             self.last_play = 0.0
-            if key is None and self.player:
+            if self.player:
                 self.player.stop()
             if key is not None:
                 self._play(key, now)

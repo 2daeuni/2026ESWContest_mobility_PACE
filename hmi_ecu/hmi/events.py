@@ -41,14 +41,28 @@ def diff(prev, cur):
 
     if prev.get("risk_level") != cur.get("risk_level") and cur.get("risk_available"):
         level = cur["risk_level"]
-        add(LEVEL_SEVERITY.get(level, "info"), "Risk Level L{} ({})".format(level, cur["risk_name"]))
+        add(LEVEL_SEVERITY.get(level, "info"), "Risk Level L{} ({}) · {}".format(
+            level, cur["risk_name"], cur.get("risk_cause_ko") or "판정 근거 확인 중"))
+    elif (cur.get("risk_available") and cur.get("risk_level") in (1, 2, 3)
+          and prev.get("risk_cause") != cur.get("risk_cause")):
+        add("info", "위험 원인: {}".format(cur.get("risk_cause_ko") or "판정 근거 확인 중"))
     elif prev.get("risk_available") and not cur.get("risk_available") and cur.get("link_safety"):
         add("info", "위험도 판단 불가 상태")
 
     if cur.get("failsafe_active") and not prev.get("failsafe_active"):
         add("fault", "Fail-Safe 진입: {}".format(cur.get("failsafe_reason_ko") or "-"))
+    elif cur.get("failsafe_active") and prev.get("failsafe_reason") != cur.get("failsafe_reason"):
+        add("fault", "Fail-Safe 원인 변경: {}".format(cur.get("failsafe_reason_ko") or "-"))
     elif prev.get("failsafe_active") and not cur.get("failsafe_active"):
         add("ok", "Fail-Safe 해제")
+
+    if cur.get("system_phase") == "WAITING" and (
+        prev.get("system_phase") != "WAITING"
+        or prev.get("waiting_reason") != cur.get("waiting_reason")
+    ):
+        add("info", cur.get("waiting_reason_ko") or "시스템 초기화 중")
+    elif cur.get("system_phase") == "READY" and prev.get("system_phase") != "READY":
+        add("ok", "시스템 준비 완료")
 
     if cur.get("haptic_cmd_on") and not prev.get("haptic_cmd_on"):
         add("warning", "Haptic On ({:.0f}%, {:.0f}Hz)".format(

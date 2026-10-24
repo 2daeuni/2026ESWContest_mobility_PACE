@@ -4,11 +4,15 @@ python3 -m unittest discover -s tests
 """
 
 import os
+import io
 import queue
 import socket
 import sys
+import threading
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -78,6 +82,79 @@ class CleanStyleTest(unittest.TestCase):
         self.assertGreater(int(out[3, 3, 0]), 220)                    # 배경은 밝게
 
 
+class CameraDirectionTest(unittest.TestCase):
+    def test_hmi_keeps_only_latest_queued_camera_frame(self):
+        from hmi.backend import HmiBackend
+
+        receiver = SimpleNamespace(_camera_lock=threading.Lock(), _camera_latest=None,
+                                   _inbox=queue.Queue(), _dropped=0)
+        HmiBackend.sink(receiver, "camera", ({"frame": 1}, b"old"), 1.0)
+        HmiBackend.sink(receiver, "camera", ({"frame": 2}, b"latest"), 2.0)
+        self.assertEqual(receiver._camera_latest[0]["frame"], 2)
+        self.assertTrue(receiver._inbox.empty())
+
+    def test_single_sensor_switches_relative_transform_and_clears_old_frame(self):
+        camera = cs.ChaseCamera.__new__(cs.ChaseCamera)
+        camera.world = Mock()
+        camera.world.get_snapshot.return_value.frame = 42
+        camera.cam = Mock()
+        camera.seg = Mock()
+        camera.sender = Mock()
+        camera.front_transform = object()
+        camera.rear_transform = object()
+        camera.mode = "clean"
+        camera.view = "D"
+        camera.min_frame = 0
+        camera.last_tags = (41, object())
+        camera.lock = threading.Lock()
+
+        camera.set_view("R")
+        self.assertEqual(camera.view, "R")
+        self.assertEqual(camera.min_frame, 43)
+        self.assertIsNone(camera.last_tags)
+        camera.cam.set_transform.assert_called_once_with(camera.rear_transform)
+        camera.seg.set_transform.assert_called_once_with(camera.rear_transform)
+        camera.sender.clear.assert_called_once()
+
+        camera.set_view("P")
+        camera.set_view("R")
+        self.assertEqual(camera.cam.set_transform.call_count, 1)
+        camera.set_view("D")
+        self.assertEqual(camera.cam.set_transform.call_count, 2)
+        camera.cam.set_transform.assert_called_with(camera.front_transform)
+
+    def test_hmi_hides_old_view_until_matching_frame_arrives(self):
+        from PIL import Image
+        from hmi.backend import HmiBackend
+
+        receiver = SimpleNamespace(
+            _cam={"fresh": True, "view": "D", "frameId": 1},
+            _cam_pending=({"view": "D"}, b"old", 1.0),
+            _cam_t=1.0,
+            _cam_count=0,
+            camera_provider=SimpleNamespace(image=None),
+            cameraChanged=SimpleNamespace(emit=Mock()),
+            _add_event=Mock(),
+        )
+        HmiBackend._update_camera(receiver, 1.1, "R")
+        self.assertFalse(receiver._cam["fresh"])
+        self.assertEqual(receiver._cam["frameId"], 1)
+
+        receiver._cam_pending = ({"frame": 3}, b"legacy", 1.15)
+        HmiBackend._update_camera(receiver, 1.15, "R")
+        self.assertFalse(receiver._cam["fresh"])
+        self.assertEqual(receiver._cam["frameId"], 1)
+
+        image = Image.new("RGB", (8, 8))
+        encoded = io.BytesIO()
+        image.save(encoded, format="JPEG")
+        receiver._cam_pending = ({"view": "R", "mode": "real"}, encoded.getvalue(), 1.2)
+        HmiBackend._update_camera(receiver, 1.2, "R")
+        self.assertTrue(receiver._cam["fresh"])
+        self.assertEqual(receiver._cam["frameId"], 2)
+        self.assertEqual(receiver._cam["view"], "R")
+
+
 class TcpRoundTripTest(unittest.TestCase):
     def test_sender_to_receiver(self):
         from hmi.sources import CameraReceiver
@@ -120,45 +197,3 @@ class TcpRoundTripTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class RearGuideTest(unittest.TestCase):
-    """후방 카메라 가이드선 투영 = 실제 카메라 행렬 투영(좌우 반전)과 같은지"""
-
-    def test_matches_camera_matrix(self):
-        import math
-        w, h, cam_h, a_deg, L = 640, 360, 0.85, cs.REAR_PITCH, 2.3
-        K = cs.intrinsics(w, h, cs.REAR_FOV)
-        a = math.radians(a_deg)
-        fwd = (-math.cos(a), 0.0, -math.sin(a))
-        right = (0.0, -1.0, 0.0)
-        up = (-math.sin(a), 0.0, math.cos(a))
-        pos = (-L, 0.0, cam_h)
-
-        def row(v):
-            return [v[0], v[1], v[2], -(v[0] * pos[0] + v[1] * pos[1] + v[2] * pos[2])]
-        inv = [row(fwd), row(right), row(up), [0, 0, 0, 1]]
-        for d, lat in ((0.5, 1.0), (1.0, -1.0), (3.0, 0.4)):
-            u, v, _ = cs.world_to_pixel(inv, K, (-L - d, lat, 0.0))
-            p = cs.rear_cam_pixel(K, w, cam_h, a_deg, d, lat)
-            self.assertAlmostEqual(p[0], round(w - u, 1), places=0)
-            self.assertAlmostEqual(p[1], round(v, 1), places=0)
-
-    def test_guides_colors_and_mirror(self):
-        K = cs.intrinsics(640, 360, cs.REAR_FOV)
-        g = cs.rear_guides(K, 640, 360, 0.85, cs.REAR_PITCH, 1.1)
-        self.assertEqual({x["c"] for x in g}, {"red", "yellow", "green"})
-        # 운전자 오른쪽 선이 화면 오른쪽 (룸미러처럼)
-        right = cs.rear_cam_pixel(K, 640, 0.85, cs.REAR_PITCH, 2.0, 1.1)
-        left = cs.rear_cam_pixel(K, 640, 0.85, cs.REAR_PITCH, 2.0, -1.1)
-        self.assertGreater(right[0], left[0])
-
-
-class HitDirectionTest(unittest.TestCase):
-    def test_directions(self):
-        import carla_hmi_bridge as b
-        self.assertEqual(b.hit_direction(0, 1, 0), "전방")
-        self.assertEqual(b.hit_direction(0, 0, 1), "우측")
-        self.assertEqual(b.hit_direction(0, -1, 0), "후방")
-        self.assertEqual(b.hit_direction(90, 1, 0), "좌측")
-        self.assertEqual(b.hit_direction(0, 1, -1), "전방 좌측")

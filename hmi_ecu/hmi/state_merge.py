@@ -29,9 +29,20 @@ FAILSAFE_REASON_KO = {
     "HAPTIC_COMMUNICATION_ERROR": "햅틱 ECU 통신 오류",
     "MOTOR_FAILSAFE_MODE": "모터 정지 명령",
     "MOTOR_NO_RESPONSE": "모터 ECU 응답 없음 · 정지 명령",
-    "MOTOR_ESTOP": "모터 비상정지(E-STOP) · 페달 떼면 복구",
+    "MOTOR_ESTOP": "모터 비상정지(E-STOP) · 안전 복구 대기",
     "MOTOR_FAULT": "모터 ECU 고장",
+    "MOTOR_DRIVER_FAULT": "모터 드라이버 고장",
+    "MOTOR_PEDAL_TIMEOUT": "모터 ECU 페달 CAN 통신 오류",
+    "MOTOR_COMMAND_TIMEOUT": "모터 ECU 명령 CAN 통신 오류",
     "CARLA_COMMUNICATION_ERROR": "CARLA 통신 오류",
+}
+
+WAITING_REASON_KO = {
+    "CARLA_WAITING": "CARLA 연결 대기",
+    "PEDAL_WAITING": "페달 ECU 연결 대기",
+    "MOTOR_STATUS_WAITING": "모터 ECU 상태 확인 중",
+    "CARLA_RECOVERING": "CARLA 데이터 확인 중",
+    "MOTOR_RECOVERY": "모터 안전 복구 확인 중",
 }
 
 GEAR_NAMES = {0: "P", 1: "R", 2: "N", 3: "D"}
@@ -207,23 +218,47 @@ def merge(can_store, udp_store, now=None):
     s["risk_available"] = available
     s["risk_name"] = RISK_NAMES.get(level, "N/A") if available else "N/A"
     s["risk_short"] = RISK_SHORT.get(level, "") if available else ""
+    s["risk_cause"] = u.get("risk_cause") if udp_fresh and available else None
+    s["normal_braking"] = bool(u.get("normal_braking")) if udp_fresh else False
+    s["pedal_misuse_active"] = bool(u.get("pedal_misuse_active")) if udp_fresh else False
+    s["pedal_conflict"] = bool(u.get("pedal_conflict")) if udp_fresh else False
+    s["time_headway_s"] = _num(u.get("time_headway_s")) if udp_fresh else None
+    s["safe_distance_m"] = _num(u.get("safe_distance_m")) if udp_fresh else None
+    s["required_deceleration_mps2"] = _num(u.get("required_deceleration_mps2")) if udp_fresh else None
+    s["risk_cause_ko"] = {
+        "COLLISION": "충돌 접근",
+        "COLLISION_AND_PEDAL": "충돌 접근·가속 오조작",
+        "HEADWAY": "차간거리 부족",
+        "PEDAL_MISUSE": "페달 오조작",
+        "RECOVERING": "위험 감소 중",
+        "NONE": "위험 없음",
+    }.get(s["risk_cause"], "판정 근거 확인 중")
 
     # -------------------------------------------------
     # Fail-safe
     # -------------------------------------------------
     failsafe = bool(u.get("failsafe_active")) if udp_fresh else False
     reason = u.get("failsafe_reason") if failsafe else None
-    if not failsafe and msta_can is not None and msta_can.get("estop_active"):
-        failsafe, reason = True, "MOTOR_ESTOP"
-    elif not failsafe and msta_can is not None and msta_can.get("motor_state") == 3:
-        failsafe, reason = True, "MOTOR_FAULT"
-    elif not failsafe and mcmd_can is not None and mcmd_can["control_mode"] == 2:
-        # safety_ecu main.py: MOTOR_STATUS 0.1 s 이상 없으면 정지 명령(E-STOP)
-        failsafe = True
-        reason = "MOTOR_NO_RESPONSE" if msta_can is None else "MOTOR_FAILSAFE_MODE"
+    phase = u.get("system_phase") if udp_fresh else None
+    if phase not in ("WAITING", "READY", "FAIL_SAFE"):
+        phase = None
+    if not failsafe and msta_can is not None and (not udp_fresh or phase == "READY"):
+        if msta_can.get("estop_active") and not (
+            udp_fresh and (u.get("motor_estop_commanded") or u.get("motor_recovery_pending"))
+        ):
+            failsafe, reason = True, "MOTOR_ESTOP"
+        elif msta_can.get("motor_state") == 3 and not msta_can.get("estop_active"):
+            failsafe, reason = True, "MOTOR_FAULT"
+    if phase is None:
+        phase = "FAIL_SAFE" if failsafe else "READY" if udp_fresh and u.get("risk_available") else "WAITING"
+    elif failsafe:
+        phase = "FAIL_SAFE"
     s["failsafe_active"] = failsafe
     s["failsafe_reason"] = reason
     s["failsafe_reason_ko"] = FAILSAFE_REASON_KO.get(reason, reason or "")
+    s["system_phase"] = phase
+    s["waiting_reason"] = u.get("waiting_reason") if udp_fresh and phase == "WAITING" else None
+    s["waiting_reason_ko"] = WAITING_REASON_KO.get(s["waiting_reason"], "초기화 중")
 
     # -------------------------------------------------
     # Haptic command (0x110) / status (0x200)
@@ -243,6 +278,11 @@ def merge(can_store, udp_store, now=None):
         s["haptic_cmd_intensity"] = None
         s["haptic_cmd_frequency"] = None
         s["haptic_cmd_source"] = "-"
+
+    s["pedal_warning_active"] = (
+        s["risk_level"] in (1, 2, 3)
+        and s["haptic_cmd_on"] is True
+    )
 
     if hsta_can is not None:
         s["haptic_vibrating"] = hsta_can["vibration_status"] == 1
@@ -318,8 +358,6 @@ def merge(can_store, udp_store, now=None):
 
     s["demo_drive"] = False
     s["demo_carla"] = False
-    s["rear_distance_m"] = None
-    s["rear_kind"] = None
     s["demo_collided"] = False
     s["demo_input"] = ""
 
@@ -353,6 +391,13 @@ def _banner(s, u, udp_fresh):
             "subtitle": "Fail-Safe Active",
         }
 
+    if s["system_phase"] == "WAITING":
+        return {
+            "severity": "info",
+            "title": s["waiting_reason_ko"],
+            "subtitle": "Safety initialization — motor output disabled",
+        }
+
     if not udp_fresh and not s["risk_available"]:
         return {"severity": "info", "title": "Safety ECU 상세 상태(UDP) 미수신 · CAN 명령만 표시", "subtitle": "Waiting for Safety ECU state"}
 
@@ -366,16 +411,21 @@ def _banner(s, u, udp_fresh):
 
 def _level_banner(s):
     level = s["risk_level"]
-    accel = (s["accelerator"] or 0) >= config.BRAKE_NOW_ACCEL_MIN
+    if s.get("normal_braking") and s.get("risk_cause") == "RECOVERING":
+        return {"severity": "ok", "title": "정상 제동 중", "subtitle": "Risk decreasing"}
 
     if level == 3:
-        title = "가속 페달 오조작! 브레이크를 밟으세요" if accel else "충돌 위험! 브레이크를 밟으세요"
+        title = ("페달 오조작 위험! 즉시 제동하세요" if s.get("pedal_warning_active")
+                 else "충돌 위험! 즉시 제동하세요")
         return {"severity": "danger", "title": title, "subtitle": "Danger — Collision Warning"}
     if level == 2:
-        title = "페달 조작 확인 · 브레이크를 준비하세요"
-        return {"severity": "warning", "title": title, "subtitle": "Warning — Check Pedal Input"}
+        title = ("가속페달에서 발을 떼세요" if s.get("pedal_warning_active")
+                 else "브레이크를 밟으세요")
+        return {"severity": "warning", "title": title, "subtitle": "Warning — " + s["risk_cause_ko"]}
     if level == 1:
-        return {"severity": "caution", "title": "전방 상황에 주의하세요", "subtitle": "Caution"}
+        title = ("페달 조작 주의" if s.get("risk_cause") == "PEDAL_MISUSE"
+                 else "후방 차량 주의" if s.get("gear") == "R" else "전방 차량 주의")
+        return {"severity": "caution", "title": title, "subtitle": "Caution — " + s["risk_cause_ko"]}
     return {"severity": "ok", "title": "정상 주행 중", "subtitle": "Normal"}
 
 
@@ -394,25 +444,13 @@ def apply_carla(s, scene_packet):
             s["speed_source"] = "CARLA"
     if s.get("gear") is None:
         s["gear"] = _gear(ego.get("gear"))
-    rd, rk = carla_rear(scene_packet)
-    s["rear_distance_m"] = rd
-    s["rear_kind"] = rk
-    if s.get("distance_m") is None:
+        if (s["gear"] is not None
+                and s.get("banner", {}).get("title") in ("전방 차량 주의", "후방 차량 주의")):
+            s["banner"] = _level_banner(s)
+    if s.get("distance_m") is None and s.get("risk_source") != "Safety ECU":
         lead = scene_packet.get("lead") or {}
         s["distance_m"] = _num(lead.get("distance"))
     return s
-
-
-def carla_rear(packet):
-    """후방 가장 가까운 물체 (차량 / 벽·건물) 범퍼 거리 m 와 종류"""
-    c = []
-    r = _num((packet.get("rear") or {}).get("distance"))
-    if r is not None:
-        c.append((r, "vehicle"))
-    r = _num(packet.get("rear_static"))
-    if r is not None:
-        c.append((r, "static"))
-    return min(c) if c else (None, None)
 
 
 def apply_carla_ui(s, ui_store, now):
@@ -436,33 +474,15 @@ def carla_inputs(s, packet):
     ego = packet.get("ego") or {}
     lead = packet.get("lead") or {}
     cands = []
-    if "radar" in packet:
-        # 브리지가 Safety 와 같은 근거리 레이더 방식 결과를 보냄 → 그대로 사용 (모든 방향, None = 없음)
-        r = packet.get("radar") or {}
-        dist = _num(r.get("distance"))
-        kind = {"vehicle": "vehicle", "walker": "vehicle"}.get(r.get("kind"), "static") if dist is not None else None
-        closing = _num(r.get("closing"))
-        s["obstacle_dir"] = r.get("dir") if dist is not None else None
-        return _with_pedals(s, ego, dist, closing, kind)
-    if s.get("gear") == "R":          # 후진: 후방 거리 + 후진 속도로 판정 (후진 중 가속 페달 오조작)
-        dist, kind = carla_rear(packet)
-        v = _num(packet.get("ego_v_fwd"))
-        closing = -v if v is not None else None
-        if dist is not None:
-            cands.append((dist, closing, kind))
-        lead = {}
     if _num(lead.get("distance")) is not None:
         cands.append((_num(lead.get("distance")), _num(lead.get("closing")), "vehicle"))
-    if s.get("gear") != "R" and _num(packet.get("front_static")) is not None:
+    if _num(packet.get("front_static")) is not None:
         v = _num(packet.get("ego_v_fwd"))
         if v is None:
             v = (_num(ego.get("speed_kmh")) or 0.0) / 3.6
         cands.append((_num(packet.get("front_static")), v, "static"))
     dist, closing, kind = min(cands, key=lambda c: c[0]) if cands else (None, None, None)
-    return _with_pedals(s, ego, dist, closing, kind)
 
-
-def _with_pedals(s, ego, dist, closing, kind):
     real_pedal = s.get("pedal_source") in ("CAN", "UDP") and s.get("accelerator") is not None
     if real_pedal:
         acc, brk, rate, src = s["accelerator"], s.get("brake") or 0.0, s.get("accelerator_rate"), s["pedal_source"]
@@ -514,12 +534,9 @@ def apply_carla_local(s, inp, out, collided=False, collided_with=""):
                        "subtitle": "DEMO · CARLA — Collision " + (collided_with or "")}
     else:
         b = _level_banner(s)
-        d = s.get("obstacle_dir") or "전방"
         if lv >= 1 and inp["kind"] == "static":
-            b["title"] = b["title"].replace("전방 상황에", d + " 장애물에")
-        elif lv >= 1:
-            b["title"] = b["title"].replace("전방 상황에", d + " 상황에")
-        b["subtitle"] = "DEMO · CARLA — " + b["subtitle"] + ("" if d == "전방" else " · " + d)
+            b["title"] = b["title"].replace("전방 상황에", "전방 장애물에")
+        b["subtitle"] = "DEMO · CARLA — " + b["subtitle"]
         s["banner"] = b
     s["missing_inputs"] = []
     return s

@@ -16,6 +16,7 @@ class SystemState:
         self.pedal_alive_counter = None
 
         self.pedal_connected = False
+        self.pedal_ever_connected = False
 
         # -------------------------------------------------
         # Environment / ToF
@@ -42,6 +43,7 @@ class SystemState:
         # CARLA simulation
         # -------------------------------------------------
         self.carla_connected = False
+        self.carla_link_state = "WAITING"
         self.carla_vehicle_speed = None
         self.carla_distance_cm = None
         self.carla_distance_valid = False
@@ -49,6 +51,11 @@ class SystemState:
         self.carla_ttc = None
         self.carla_obstacle_id = None
         self.carla_obstacle_present = False
+        self.carla_gear = None
+        self.carla_sequence = None
+        self.carla_signed_speed_mps = None
+        self.carla_escape_obstacle_id = None
+        self.carla_escape_distance_m = None
 
         # -------------------------------------------------
         # Haptic ECU
@@ -97,6 +104,7 @@ class SystemState:
         )
 
         self.pedal_connected = True
+        self.pedal_ever_connected = True
 
     def update_haptic(self, haptic):
         self.haptic_risk_level = (
@@ -206,7 +214,13 @@ class SystemState:
         return True
 
     def update_carla(self, receiver):
-        self.carla_connected = receiver.connected
+        self.carla_connected = receiver.ready
+        self.carla_link_state = receiver.link_state
+        self.carla_gear = receiver.gear
+        self.carla_sequence = receiver.sequence
+        self.carla_signed_speed_mps = receiver.signed_speed_mps
+        self.carla_escape_obstacle_id = receiver.escape_obstacle_id
+        self.carla_escape_distance_m = receiver.escape_distance_m
 
         self.carla_vehicle_speed = (
             receiver.vehicle_speed
@@ -219,11 +233,11 @@ class SystemState:
         )
 
         self.carla_distance_valid = (
-            receiver.connected
+            receiver.ready
             and receiver.distance_m is not None
         )
 
-        self.carla_obstacle_present = bool(receiver.connected and receiver.obstacle_id is not None)
+        self.carla_obstacle_present = bool(receiver.ready and receiver.obstacle_id is not None)
         self.carla_obstacle_id = receiver.obstacle_id if self.carla_obstacle_present else None
         if self.carla_obstacle_present:
             self.carla_closing_speed_mps = receiver.closing_speed_mps
@@ -232,11 +246,12 @@ class SystemState:
             # Fresh absence is safe; disconnected absence is unavailable.
             self.carla_distance_cm = None
             self.carla_distance_valid = False
-            self.carla_closing_speed_mps = 0.0 if receiver.connected else None
+            self.carla_closing_speed_mps = 0.0 if receiver.ready else None
             self.carla_ttc = None
 
-    def invalidate_carla(self):
+    def invalidate_carla(self, link_state="LOST"):
         self.carla_connected = False
+        self.carla_link_state = link_state
         self.carla_vehicle_speed = None
         self.carla_distance_cm = None
         self.carla_distance_valid = False
@@ -244,3 +259,8 @@ class SystemState:
         self.carla_ttc = None
         self.carla_obstacle_id = None
         self.carla_obstacle_present = False
+        self.carla_gear = None
+        self.carla_sequence = None
+        self.carla_signed_speed_mps = None
+        self.carla_escape_obstacle_id = None
+        self.carla_escape_distance_m = None

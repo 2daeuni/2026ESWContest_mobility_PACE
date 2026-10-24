@@ -11,6 +11,7 @@ from test_risk_pipeline import Pipeline, CarlaReceiverV2, SystemState, FailSafeM
 SOURCE = Path(__file__).resolve().parents[2] / 'carla_sim/carla_pedal_control_v17_safety_json_5006.py'
 TREE = ast.parse(SOURCE.read_text())
 NODE = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'build_safety_telemetry')
+ID_NODE = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'safety_candidate_id')
 
 
 class ObstacleClearTests(unittest.TestCase):
@@ -38,14 +39,17 @@ class ObstacleClearTests(unittest.TestCase):
         self.detect = Mock(return_value=None)
         self.ns = dict(get_speed_kmh=lambda ego: 30., get_forward_speed_mps=lambda *args: 5.,
                        NIGHT_SCENARIO_OBSTACLE_ID=900001, find_front_vehicle_for_safety=self.detect,
-                       find_extra_obstacle_for_safety=lambda world, ego, gear: None)
-        exec(compile(ast.Module(body=[NODE], type_ignores=[]), str(SOURCE), 'exec'), self.ns)
+                       SAFETY_FRONT_MAX_DISTANCE_M=50.0,
+                       SAFETY_FRONT_MAX_LOOKAHEAD_M=120.0,
+                       SAFETY_FRONT_LOOKAHEAD_S=4.5,
+                       SAFETY_VEHICLE_ONLY=True)
+        exec(compile(ast.Module(body=[ID_NODE, NODE], type_ignores=[]), str(SOURCE), 'exec'), self.ns)
         self.build = self.ns['build_safety_telemetry']
         self.ego = Mock()
 
-    def test_virtual_preview_handoff_and_consumed_zero(self):
+    def test_virtual_preview_ignored_until_real_vehicle_exists(self):
         preview = self.build(None, self.ego, 1, True, 60.)
-        self.assertEqual(preview['obstacle_id'], 900001)
+        self.assertIsNone(preview['obstacle_id'])
         real = dict(actor=SimpleNamespace(id=77), distance_m=0., closing_speed_mps=5., ttc_s=0.)
         self.detect.return_value = real
         collision = self.build(None, self.ego, 2, True, 10., True)
@@ -70,7 +74,7 @@ class ObstacleClearTests(unittest.TestCase):
             nonlocal seq
             packet = dict(packet, sequence=seq)
             seq += 1
-            receiver.sock.recvfrom.return_value = (json.dumps(packet).encode(), ('192.168.0.57', 5006))
+            receiver.sock.recvfrom.return_value = (json.dumps(packet).encode(), ('192.168.50.1', 5006))
             with patch('carla.receiver_v2.time.monotonic', return_value=100.):
                 self.assertTrue(receiver.receive())
             state.update_carla(receiver)
@@ -84,7 +88,9 @@ class ObstacleClearTests(unittest.TestCase):
             return pipeline.r.evaluate(bs, pipeline.b.available, ps, pipeline.p.available, **conditions)[1]
 
         clear = self.build(None, self.ego, 0, False, None)
-        self.assertEqual(step(clear), 0)
+        self.assertEqual(clear['gear'], 'D')
+        for _ in range(receiver.READY_CONFIRM_COUNT):
+            self.assertEqual(step(clear), 0)
         collision = dict(clear, obstacle_id=77, distance_m=0., closing_speed_mps=5., ttc_s=0.)
         for expected in (0, 0, 3):
             self.assertEqual(step(collision), expected)

@@ -1,3 +1,4 @@
+import os
 import time
 
 from canbus.receiver import CANReceiver
@@ -22,6 +23,7 @@ from logger.pedal_diagnostics import PedalDiagnostics
 from risk.bns import BNSCalculator
 from risk.pms import PMSCalculator
 from risk.risk_manager import RiskManager
+from risk.directional_policy import DirectionalRiskPolicy
 
 from carla.receiver_v2 import CarlaReceiverV2
 from carla.control_sender import CarlaControlSender
@@ -34,6 +36,8 @@ INPUT_MODE_HARDWARE = "HARDWARE"
 INPUT_MODE_CARLA = "CARLA"
 
 INPUT_MODE = INPUT_MODE_CARLA
+MOTOR_STATUS_TIMEOUT_S = 0.1
+MOTOR_STARTUP_GRACE_S = 0.3
 
 def main():
     # -------------------------------------------------
@@ -55,7 +59,7 @@ def main():
 
     if INPUT_MODE == INPUT_MODE_CARLA:
         carla_receiver = CarlaReceiverV2(
-            host="192.168.0.37",
+            host="192.168.50.2",
             port=5006,
             timeout=0.5,
         )
@@ -71,13 +75,16 @@ def main():
     motor_status = None
     motor_last_rx_time = None
 
-    motor_communication_fault = True
     motor_recovery_required = True
-    motor_timeout_reported = False
+    previous_motor_link_state = None
+    previous_motor_error_reason = None
+    previous_motor_estop_commanded = False
+    startup_started = time.monotonic()
 
     bns_calculator = BNSCalculator()
     pms_calculator = PMSCalculator()
     risk_manager = RiskManager()
+    carla_risk_policy = DirectionalRiskPolicy()
     hmi_sender = HmiSender()
     carla_control_sender = CarlaControlSender()
 
@@ -101,6 +108,8 @@ def main():
     # -------------------------------------------------
     previous_failsafe_active = None
     previous_failsafe_reason = None
+    previous_waiting_reason = None
+    previous_carla_link_state = None
 
     # -------------------------------------------------
     # CARLA state logging
@@ -110,6 +119,7 @@ def main():
     last_risk_log_time = 0.0
     RISK_LOG_INTERVAL = 0.5
     last_risk_debug_time = 0.0
+    risk_trace_enabled = os.environ.get("PACE_RISK_TRACE") == "1"
 
     # -------------------------------------------------
     # CAN command transmission
@@ -118,6 +128,8 @@ def main():
 
     haptic_alive_counter = 0
     motor_alive_counter = 0
+    previous_haptic_command_on = False
+    haptic_off_ack_deadline = None
 
     try:
         hmi_sender.start()
@@ -157,7 +169,11 @@ def main():
                             "[CARLA] DATA TIMEOUT"
                         )
 
-                    state.invalidate_carla()
+                    state.invalidate_carla(carla_receiver.link_state)
+
+                if state.carla_link_state != previous_carla_link_state:
+                    print(f"[CARLA] LINK={state.carla_link_state}", flush=True)
+                    previous_carla_link_state = state.carla_link_state
 
             # =================================================
             # CAN receive
@@ -345,6 +361,17 @@ def main():
                             haptic
                         )
 
+                        if (
+                            haptic_off_ack_deadline is not None
+                            and haptic["risk_level"] == state.risk_level
+                            and haptic["vibration_status"] == 0
+                            and haptic["intensity"] == 0
+                            and haptic["frequency"] == 0
+                            and haptic["command_timeout"] == 0
+                        ):
+                            print("[HAPTIC] OFF applied (0x200 status)", flush=True)
+                            haptic_off_ack_deadline = None
+
                         haptic_timeout_reported = (
                             False
                         )
@@ -417,7 +444,7 @@ def main():
             ):
                 state.pedal_connected = False
 
-                if not pedal_timeout_reported:
+                if state.pedal_ever_connected and not pedal_timeout_reported:
                     print(
                         "[PEDAL] "
                         "COMMUNICATION TIMEOUT"
@@ -503,22 +530,68 @@ def main():
             # =================================================
             # Integrated risk evaluation
             # =================================================
-            (
-                state.total_risk,
-                state.risk_level,
-            ) = risk_manager.evaluate(
-                bns=state.bns,
-                bns_available=(
-                    bns_calculator.available
-                ),
-                pms=state.pms,
-                pms_available=(
-                    pms_calculator.available
-                ),
-                level1_conditions=(bns_calculator.distance_l1, bns_calculator.ttc_l1, pms_calculator.pedal_l1),
-                level2_conditions=(bns_calculator.distance_l2, bns_calculator.ttc_l2, pms_calculator.pedal_l2),
-                level3_conditions=(bns_calculator.distance_l3, bns_calculator.ttc_l3, pms_calculator.pedal_l3),
-            )
+            risk_level_before = state.risk_level
+            if INPUT_MODE == INPUT_MODE_CARLA:
+                state.total_risk, state.risk_level = carla_risk_policy.evaluate(
+                    gear=state.carla_gear,
+                    distance_m=bns_distance_cm / 100.0 if bns_distance_cm is not None else None,
+                    speed_kmh=bns_vehicle_speed,
+                    closing_speed_mps=state.carla_closing_speed_mps,
+                    ttc_s=bns_ttc,
+                    obstacle_present=state.carla_obstacle_present,
+                    bns=state.bns,
+                    bns_available=bns_calculator.available,
+                    pms=state.pms,
+                    pms_available=pms_calculator.available,
+                    now=time.monotonic(),
+                    brake=state.brake,
+                    brake_rate=state.brake_rate,
+                    accelerator=state.accelerator,
+                    sequence=state.carla_sequence,
+                    obstacle_id=state.carla_obstacle_id,
+                    signed_speed_mps=state.carla_signed_speed_mps,
+                    escape_obstacle_id=state.carla_escape_obstacle_id,
+                    escape_distance_m=state.carla_escape_distance_m,
+                    pedal_l1=pms_calculator.pedal_l1,
+                    pedal_l2=pms_calculator.pedal_l2,
+                    pedal_l3=pms_calculator.pedal_l3,
+                    pedal_conflict=pms_calculator.pedal_conflict,
+                )
+                state.bns = carla_risk_policy.bns_score
+                active_risk_manager = carla_risk_policy
+                if carla_risk_policy.reason == "BRAKE_RELEASE":
+                    print(
+                        f"[RISK] BRAKE_RELEASE -> L0 BRAKE={state.brake}% "
+                        f"ACC={state.accelerator}% SPEED={bns_vehicle_speed}km/h "
+                        f"CLOSING={state.carla_closing_speed_mps}m/s",
+                        flush=True,
+                    )
+            else:
+                state.total_risk, state.risk_level = risk_manager.evaluate(
+                    bns=state.bns,
+                    bns_available=bns_calculator.available,
+                    pms=state.pms,
+                    pms_available=pms_calculator.available,
+                    level1_conditions=(bns_calculator.distance_l1, bns_calculator.ttc_l1, pms_calculator.pedal_l1),
+                    level2_conditions=(bns_calculator.distance_l2, bns_calculator.ttc_l2, pms_calculator.pedal_l2),
+                    level3_conditions=(bns_calculator.distance_l3, bns_calculator.ttc_l3, pms_calculator.pedal_l3),
+                )
+                active_risk_manager = risk_manager
+
+            if risk_trace_enabled and state.risk_level != risk_level_before:
+                print(
+                    f"[RISK TRANSITION] L{risk_level_before}->L{state.risk_level} "
+                    f"source={INPUT_MODE} sequence={state.carla_sequence if INPUT_MODE == INPUT_MODE_CARLA else None} "
+                    f"target={state.carla_obstacle_id if INPUT_MODE == INPUT_MODE_CARLA else None} "
+                    f"distance_m={bns_distance_cm / 100.0 if bns_distance_cm is not None else None} "
+                    f"ttc_s={bns_ttc} "
+                    f"closing_mps={state.carla_closing_speed_mps if INPUT_MODE == INPUT_MODE_CARLA else None} "
+                    f"bns={state.bns:.2f} pms={state.pms:.2f} "
+                    f"candidate=L{active_risk_manager.candidate_level} "
+                    f"rule={carla_risk_policy.reason if INPUT_MODE == INPUT_MODE_CARLA else 'LEGACY'} "
+                    f"cause={carla_risk_policy.risk_cause if INPUT_MODE == INPUT_MODE_CARLA else 'LEGACY'}",
+                    flush=True,
+                )
 
             risk_log_time = time.monotonic()
             if risk_log_time - last_risk_log_time >= RISK_LOG_INTERVAL:
@@ -528,7 +601,14 @@ def main():
                     f"TOTAL={state.total_risk:.2f} LEVEL=L{state.risk_level} "
                     f"DIST={bns_distance_cm / 100.0 if bns_distance_cm is not None else None}m "
                     f"TTC={bns_ttc}s ACC={state.accelerator}% ACC_RATE={state.accelerator_rate:.1f}%/s "
-                    f"CANDIDATE=L{risk_manager.candidate_level}", flush=True,
+                    f"GEAR={state.carla_gear if INPUT_MODE == INPUT_MODE_CARLA else 'NA'} "
+                    f"RULE={carla_risk_policy.reason if INPUT_MODE == INPUT_MODE_CARLA else 'LEGACY'} "
+                    f"CAUSE={carla_risk_policy.risk_cause if INPUT_MODE == INPUT_MODE_CARLA else 'LEGACY'} "
+                    f"HEADWAY={carla_risk_policy.time_headway_s if INPUT_MODE == INPUT_MODE_CARLA else None} "
+                    f"SAFE_DIST={carla_risk_policy.safe_distance_m if INPUT_MODE == INPUT_MODE_CARLA else None} "
+                    f"STOP_DIST={carla_risk_policy.stopping_distance_m if INPUT_MODE == INPUT_MODE_CARLA else None} "
+                    f"DECEL={carla_risk_policy.observed_deceleration_mps2 if INPUT_MODE == INPUT_MODE_CARLA else None} "
+                    f"CANDIDATE=L{active_risk_manager.candidate_level}", flush=True,
                 )
 
             # =================================================
@@ -538,6 +618,11 @@ def main():
                 state,
                 input_mode=INPUT_MODE,
             )
+
+            if failsafe.waiting_reason != previous_waiting_reason:
+                if failsafe.waiting_reason:
+                    print(f"[SYSTEM] WAITING={failsafe.waiting_reason}", flush=True)
+                previous_waiting_reason = failsafe.waiting_reason
 
             if pedal_diagnostic_sample is not None:
                 pedal_diagnostics.report(
@@ -594,12 +679,27 @@ def main():
                         state.risk_level
                     ),
                     risk_available=(
-                        risk_manager.available
+                        active_risk_manager.available
                     ),
                     failsafe_active=(
                         failsafe.active
                     ),
+                    accelerator=state.accelerator if state.pedal_connected else None,
+                    pedal_misuse_active=(
+                        carla_risk_policy.pedal_misuse_active
+                        if INPUT_MODE == INPUT_MODE_CARLA
+                        else any((pms_calculator.pedal_l1, pms_calculator.pedal_l2,
+                                  pms_calculator.pedal_l3, pms_calculator.pedal_conflict))
+                    ),
                 )
+
+                if failsafe.waiting_reason or not active_risk_manager.available:
+                    commands["motor"] = {
+                        "control_mode": 2,
+                        "output_limit": 0,
+                        "command_flags": 0x03 if failsafe.active else 0x01,
+                    }
+                    motor_recovery_required = True
 
                 # -------------------------------------------------
                 # Motor ECU communication / E-STOP recovery
@@ -607,27 +707,42 @@ def main():
                 motor_status_fresh = (
                     motor_status is not None
                     and motor_last_rx_time is not None
-                    and 0 <= current_time - motor_last_rx_time <= 0.1
+                    and 0 <= current_time - motor_last_rx_time <= MOTOR_STATUS_TIMEOUT_S
                 )
+                motor_startup_waiting = (
+                    motor_status_fresh
+                    and motor_status["fault_flags"] == 0x04
+                    and current_time - startup_started < MOTOR_STARTUP_GRACE_S
+                )
+                motor_link_state = (
+                    "WAITING" if motor_status is None or motor_startup_waiting
+                    else "READY" if motor_status_fresh else "LOST"
+                )
+                if motor_link_state != previous_motor_link_state:
+                    print(f"[MOTOR] LINK={motor_link_state}", flush=True)
+                    previous_motor_link_state = motor_link_state
+
+                motor_error_reason = None
 
                 if not motor_status_fresh:
-                    motor_communication_fault = True
                     motor_recovery_required = True
-
-                    if not motor_timeout_reported:
-                        print("[MOTOR] STATUS TIMEOUT - E-STOP REQUESTED")
-                        motor_timeout_reported = True
-
+                    if motor_status is not None:
+                        motor_error_reason = "MOTOR_NO_RESPONSE"
                     commands["motor"] = {
                         "control_mode": 2,
                         "output_limit": 0,
-                        "command_flags": 0x03,
+                        "command_flags": 0x03 if motor_error_reason or failsafe.active else 0x01,
+                    }
+
+                elif motor_startup_waiting:
+                    motor_recovery_required = True
+                    commands["motor"] = {
+                        "control_mode": 2,
+                        "output_limit": 0,
+                        "command_flags": 0x03 if failsafe.active else 0x01,
                     }
 
                 else:
-                    motor_communication_fault = False
-                    motor_timeout_reported = False
-
                     motor_estop_active = (
                         motor_status["fault_flags"] & 0x08
                     ) != 0
@@ -638,6 +753,8 @@ def main():
 
                     motor_safe_to_recover = (
                         not failsafe.active
+                        and not failsafe.waiting_reason
+                        and active_risk_manager.available
                         and state.pedal_connected
                         and state.pedal_sensor_status == 0
                         and state.accelerator <= 3
@@ -645,18 +762,36 @@ def main():
                         and not motor_other_fault
                     )
 
-                    if failsafe.active:
+                    if motor_status["fault_flags"] & 0x01:
+                        motor_error_reason = "MOTOR_DRIVER_FAULT"
+                    elif motor_status["fault_flags"] & 0x02:
+                        motor_error_reason = "MOTOR_PEDAL_TIMEOUT"
+                    elif motor_status["fault_flags"] & 0x04:
+                        motor_error_reason = "MOTOR_COMMAND_TIMEOUT"
+                    elif motor_estop_active and not previous_motor_estop_commanded:
+                        motor_error_reason = "MOTOR_ESTOP"
+                    elif motor_status["motor_state"] == 3 and not motor_estop_active:
+                        motor_error_reason = "MOTOR_FAULT"
+
+                    if motor_error_reason and motor_error_reason != "MOTOR_ESTOP":
+                        motor_recovery_required = True
+                        commands["motor"] = {
+                            "control_mode": 2,
+                            "output_limit": 0,
+                            "command_flags": 0x03,
+                        }
+
+                    elif failsafe.active or failsafe.waiting_reason or state.risk_level == 3:
                         motor_recovery_required = True
 
                     elif motor_estop_active:
                         motor_recovery_required = True
 
-                        if motor_safe_to_recover:
-                            commands["motor"] = {
-                                "control_mode": 2,
-                                "output_limit": 0,
-                                "command_flags": 0x01,
-                            }
+                        commands["motor"] = {
+                            "control_mode": 2,
+                            "output_limit": 0,
+                            "command_flags": 0x01 if motor_safe_to_recover else 0x03,
+                        }
 
                     elif motor_recovery_required:
                         if (
@@ -671,8 +806,27 @@ def main():
                         commands["motor"] = {
                             "control_mode": 2,
                             "output_limit": 0,
-                            "command_flags": 0x01,
+                            "command_flags": 0x01 if motor_safe_to_recover else 0x03,
                         }
+
+                effective_failsafe_active = failsafe.active or motor_error_reason is not None
+                effective_failsafe_reason = failsafe.reason or motor_error_reason
+                if motor_error_reason != previous_motor_error_reason:
+                    print(
+                        f"[MOTOR] {'FAIL-SAFE=' + motor_error_reason if motor_error_reason else 'FAULT CLEARED'}",
+                        flush=True,
+                    )
+                    previous_motor_error_reason = motor_error_reason
+                waiting_reason = (
+                    failsafe.waiting_reason
+                    or ("MOTOR_STATUS_WAITING" if motor_link_state == "WAITING" else None)
+                    or ("MOTOR_RECOVERY" if motor_recovery_required else None)
+                )
+                system_phase = (
+                    "FAIL_SAFE" if effective_failsafe_active
+                    else "WAITING" if waiting_reason or not active_risk_manager.available
+                    else "READY"
+                )
 
                 if current_time - last_risk_debug_time >= 0.5:
                     last_risk_debug_time = current_time
@@ -684,7 +838,7 @@ def main():
                         + " ".join(f"D{i}={int(getattr(bns_calculator, f'distance_l{i}'))}" for i in (1, 2, 3)) + " "
                         + " ".join(f"T{i}={int(getattr(bns_calculator, f'ttc_l{i}'))}" for i in (1, 2, 3)) + " "
                         + " ".join(f"P{i}={int(getattr(pms_calculator, f'pedal_l{i}'))}" for i in (1, 2, 3))
-                        + f" CAND=L{risk_manager.candidate_level} LEVEL=L{state.risk_level} "
+                        + f" CAND=L{active_risk_manager.candidate_level} LEVEL=L{state.risk_level} "
                         f"CMD_MODE={commands['motor']['control_mode']} LIMIT={commands['motor']['output_limit']}",
                         flush=True,
                     )
@@ -692,7 +846,7 @@ def main():
                 # ---------------------------------------------
                 # Haptic command
                 # ---------------------------------------------
-                sender.send_haptic_command(
+                haptic_command_sent = sender.send_haptic_command(
                     risk_level=(
                         state.risk_level
                     ),
@@ -716,10 +870,27 @@ def main():
                     ),
                 )
 
+                haptic_command_on = bool(commands["haptic"]["vibration_command"])
+                if previous_haptic_command_on and not haptic_command_on:
+                    print(
+                        f"[HAPTIC] L{state.risk_level} "
+                        f"OFF CAN_TX={'OK' if haptic_command_sent else 'FAILED'}",
+                        flush=True,
+                    )
+                    haptic_off_ack_deadline = (
+                        current_time + 0.2 if haptic_command_sent else None
+                    )
+                elif haptic_command_on:
+                    haptic_off_ack_deadline = None
+                elif haptic_off_ack_deadline is not None and current_time >= haptic_off_ack_deadline:
+                    print("[HAPTIC] OFF status not confirmed within 0.2s", flush=True)
+                    haptic_off_ack_deadline = None
+                previous_haptic_command_on = haptic_command_on
+
                 # ---------------------------------------------
                 # Motor command
                 # ---------------------------------------------
-                sender.send_motor_command(
+                motor_command_sent = sender.send_motor_command(
                     control_mode=(
                         commands["motor"][
                             "control_mode"
@@ -742,6 +913,8 @@ def main():
                         motor_alive_counter
                     ),
                 )
+                if motor_command_sent:
+                    previous_motor_estop_commanded = bool(commands["motor"]["command_flags"] & 0x02)
 
                 # ---------------------------------------------
                 # System logger
@@ -755,20 +928,25 @@ def main():
                         pms_calculator.available
                     ),
                     risk_available=(
-                        risk_manager.available
+                        active_risk_manager.available
                     ),
-                    failsafe_active=(
-                        failsafe.active
-                    ),
-                    failsafe_reason=(
-                        failsafe.reason
-                    ),
+                    failsafe_active=effective_failsafe_active,
+                    failsafe_reason=effective_failsafe_reason,
                     commands=commands,
                 )
 
+                risk_trace_fields = {}
+                if risk_trace_enabled and INPUT_MODE == INPUT_MODE_CARLA:
+                    risk_trace_fields = {
+                        "risk_cause": carla_risk_policy.risk_cause,
+                        "risk_reason": carla_risk_policy.reason,
+                        "target_id": state.carla_obstacle_id,
+                    }
                 carla_control_sender.send(
-                    commands["motor"], state.risk_level, failsafe.active,
+                    commands["motor"], state.risk_level, effective_failsafe_active,
                     now=current_time,
+                    gear=state.carla_gear if INPUT_MODE == INPUT_MODE_CARLA else None,
+                    **risk_trace_fields,
                 )
 
                 # Snapshot final commands after Motor E-STOP/recovery overrides.
@@ -778,11 +956,22 @@ def main():
                     input_mode=INPUT_MODE,
                     bns_available=bns_calculator.available,
                     pms_available=pms_calculator.available,
-                    risk_available=risk_manager.available,
-                    failsafe_active=failsafe.active,
-                    failsafe_reason=failsafe.reason,
+                    risk_available=active_risk_manager.available,
+                    failsafe_active=effective_failsafe_active,
+                    failsafe_reason=effective_failsafe_reason,
                     commands=commands,
                     motor_connected=motor_status_fresh,
+                    motor_status_seen=motor_status is not None,
+                    motor_recovery_pending=motor_recovery_required,
+                    system_phase=system_phase,
+                    waiting_reason=waiting_reason,
+                    risk_cause=(carla_risk_policy.risk_cause if INPUT_MODE == INPUT_MODE_CARLA else None),
+                    normal_braking=(carla_risk_policy.normal_braking if INPUT_MODE == INPUT_MODE_CARLA else False),
+                    pedal_misuse_active=(carla_risk_policy.pedal_misuse_active if INPUT_MODE == INPUT_MODE_CARLA else False),
+                    pedal_conflict=pms_calculator.pedal_conflict,
+                    time_headway_s=(carla_risk_policy.time_headway_s if INPUT_MODE == INPUT_MODE_CARLA else None),
+                    safe_distance_m=(carla_risk_policy.safe_distance_m if INPUT_MODE == INPUT_MODE_CARLA else None),
+                    required_deceleration_mps2=(carla_risk_policy.required_deceleration_mps2 if INPUT_MODE == INPUT_MODE_CARLA else None),
                 )
 
                 haptic_alive_counter = (

@@ -35,7 +35,7 @@ class NativeCenterBridgeTests(unittest.TestCase):
                     device.upload_effect.assert_not_called()
                     device.erase_effect.assert_not_called()
                     device.close.assert_called_once()
-                    self.assertEqual(udp.sendto.call_args.args[1], bridge.UDP_DESTINATION)
+                    self.assertEqual(udp.sendto.call_args.args[1], ('192.168.50.1', 5005))
                     expected = b'0,100,0.0000,P' if disconnect else b'0,100,0.2500,D'
                     self.assertEqual(udp.sendto.call_args.args[0], expected)
 

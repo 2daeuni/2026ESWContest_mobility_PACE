@@ -39,12 +39,12 @@ Window {
     World3D {
         id: world3d
         carlaMap: hmi.carlaMap
-        reverse: win.s.gear === "R"
         sc: win.s.scene || ({})
         speed: win.s.speed_kmh || 0
         level: win.s.risk_level || 0
         braking: (win.s.brake || 0) > 3
-        distance: Theme.has(win.s.distance_m) ? win.s.distance_m : (win.s.scene ? win.s.scene.lead_gap : null)
+        distance: win.s.risk_source === "Safety ECU" ? win.s.distance_m
+                  : (Theme.has(win.s.distance_m) ? win.s.distance_m : (win.s.scene ? win.s.scene.lead_gap : null))
     }
     FrameAnimation {
         running: (win.s.speed_kmh || 0) > 0.3
@@ -243,6 +243,21 @@ Window {
                 NumberAnimation { to: 2; duration: 260 }
             }
             z: 50
+        }
+
+        WarningBanner {
+            width: win.designW * 0.86
+            height: win.designH * 0.20
+            anchors.centerIn: parent
+            banner: win.s.banner
+            prominent: true
+            visible: win.s.banner
+                     && (win.s.banner.severity === "caution"
+                         || win.s.banner.severity === "warning"
+                         || win.s.banner.severity === "danger")
+                     && win.s.brake_now !== true
+                     && win.s.demo_collided !== true
+            z: 55
         }
 
         BrakeNowOverlay {

@@ -29,7 +29,7 @@ class MotorPolicyTests(unittest.TestCase):
                 with self.subTest(risk=risk, available=available, failsafe=failsafe):
                     motor = mapper.map(risk, available, failsafe)['motor']
                     mode, limit = (2, 0) if failsafe else expected
-                    flags = 3 if failsafe else 1
+                    flags = 3 if failsafe or risk == 3 else 1
                     self.assertEqual(motor, dict(control_mode=mode, output_limit=limit,
                                                  command_flags=flags))
                     sender.send_motor_command(motor['control_mode'], motor['output_limit'],

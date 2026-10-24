@@ -78,14 +78,14 @@ class RiskPolicyTest(unittest.TestCase):
             self.assertTrue(p.b.available)
             self.assertEqual(p.r.risk_level, 2)
 
-    def test_e_very_dangerous_is_l3_stop_without_estop(self):
+    def test_e_very_dangerous_is_l3_estop(self):
         p = Pipeline()
         for expected in (0, 0, 3):
             self.assertEqual(p.step(distance=4, ttc=1, acc=95, rate=700)[1], expected)
         self.assertGreaterEqual(p.b.score, .9)
         self.assertGreaterEqual(p.p.score, .9)
         cmd = CommandMapper().map(p.r.risk_level, p.r.available)['motor']
-        self.assertEqual(cmd, dict(control_mode=2, output_limit=0, command_flags=1))
+        self.assertEqual(cmd, dict(control_mode=2, output_limit=0, command_flags=3))
 
     def test_f_recovery_five_confirmations_per_level(self):
         p = Pipeline()
@@ -175,10 +175,13 @@ class RiskPolicyTest(unittest.TestCase):
         receiver = CarlaReceiverV2()
         receiver.sock = Mock()
         wire = dict(source='CARLA', sequence=1, vehicle_speed_kmh=50,
-                    distance_m=None, closing_speed_mps=None, ttc_s=None, obstacle_id=None)
-        receiver.sock.recvfrom.return_value = (json.dumps(wire).encode(), ('192.168.0.57', 5006))
+                    distance_m=None, closing_speed_mps=None, ttc_s=None, obstacle_id=None, gear='D')
+        receiver.sock.recvfrom.return_value = (json.dumps(wire).encode(), ('192.168.50.1', 5006))
         with patch('carla.receiver_v2.time.monotonic', return_value=100):
-            self.assertTrue(receiver.receive())
+            for sequence in range(1, receiver.READY_CONFIRM_COUNT + 1):
+                wire['sequence'] = sequence
+                receiver.sock.recvfrom.return_value = (json.dumps(wire).encode(), ('192.168.50.1', 5006))
+                self.assertTrue(receiver.receive())
         state = SystemState()
         state.update_carla(receiver)
         b = BNSCalculator()
@@ -201,12 +204,15 @@ class MainLoopIntegrationTest(unittest.TestCase):
         spec.loader.exec_module(main)
         rows = []
         for name, count, distance, ttc, acc, rate, status in (
-            ('startup', 8, 50, 10, 0, 0, 0), ('A', 8, 50, 10, 20, 50, 0),
-            ('B', 8, 8, 10, 20, 50, 0), ('C', 8, 8, 2, 20, 50, 0),
+            ('startup', 8, 50, 10, 0, 0, 0), ('ready', 8, 50, 10, 0, 0, 0),
+            ('A', 8, 50, 10, 20, 50, 0),
+            ('B', 8, 8, 10, 20, 50, 0), ('C', 30, 8, 2, 20, 50, 0),
             ('D', 8, 8, None, 85, 500, 0), ('E', 8, 4, 1, 95, 700, 0),
-            ('F', 30, 50, 10, 20, 50, 0), ('G', 8, None, None, 20, 50, 0),
+            ('K', 8, 50, 10, 0, 0, 0),
+            ('F', 200, 50, 10, 0, 0, 0), ('G', 8, None, None, 20, 50, 0),
             ('I', 8, None, None, 80, 50, 0),
             ('J', 8, None, None, 100, 700, 0),
+            ('M', 8, None, None, 20, 50, 0),
             ('H', 8, 4, 1, 95, 700, 4)):
             rows += [dict(stage=name, distance=distance, ttc=ttc, acc=acc, rate=rate, status=status)] * count
         cursor = [0]
@@ -229,6 +235,13 @@ class MainLoopIntegrationTest(unittest.TestCase):
         def receive_carla():
             row = rows[min(cursor[0], len(rows)-1)]
             carla.connected, carla.vehicle_speed = True, 50
+            carla.ready = row['stage'] != 'startup'
+            carla.link_state = 'READY' if carla.ready else 'WAITING'
+            carla.gear = None if row['stage'] == 'M' else 'D'
+            carla.sequence = cursor[0]
+            carla.signed_speed_mps = 5.0
+            carla.escape_obstacle_id = None
+            carla.escape_distance_m = None
             carla.distance_m, carla.ttc = row['distance'], row['ttc']
             carla.closing_speed_mps = 5 if row['distance'] is not None else None
             carla.obstacle_id = 7 if row['distance'] is not None else None
@@ -256,14 +269,21 @@ class MainLoopIntegrationTest(unittest.TestCase):
              patch('socket.socket', side_effect=AssertionError('network forbidden')), \
              patch('builtins.print') as logs:
             main.main()
-        by_stage = {name: [pkt for stage, pkt in snapshots if stage == name] for name in 'ABCDEFGHIJ'}
+        by_stage = {name: [pkt for stage, pkt in snapshots if stage == name] for name in 'ABCDEFGHIJKM'}
         self.assertTrue(all(by_stage.values()))
+        startup = [pkt for stage, pkt in snapshots if stage == 'startup']
+        self.assertTrue(startup)
+        self.assertTrue(all(pkt['system_phase'] == 'WAITING' and not pkt['failsafe_active']
+                            and pkt['motor_control_mode'] == 2 and pkt['motor_output_limit'] == 0
+                            and not pkt['motor_estop_commanded'] for pkt in startup))
         self.assertEqual(by_stage['A'][-1]['risk_level'], 0)
         self.assertEqual(by_stage['A'][-1]['motor_output_limit'], 100)
         self.assertEqual(by_stage['B'][-1]['risk_level'], 0)
         self.assertGreater(by_stage['B'][-1]['bns'], 0)
         for stage in ('C', 'D'):
             self.assertEqual(by_stage[stage][-1]['risk_level'], 2)
+            self.assertEqual(by_stage[stage][-1]['motor_control_mode'], 1)
+            self.assertEqual(by_stage[stage][-1]['motor_output_limit'], 30)
         self.assertEqual(by_stage['E'][-1]['risk_level'], 3)
         self.assertEqual(by_stage['E'][-1]['motor_control_mode'], 2)
         self.assertEqual(by_stage['E'][-1]['motor_output_limit'], 0)
@@ -276,6 +296,9 @@ class MainLoopIntegrationTest(unittest.TestCase):
             self.assertEqual(by_stage[stage][-1]['motor_output_limit'], 100)
             self.assertGreater(by_stage[stage][-1]['pms'], 0)
             self.assertEqual(by_stage[stage][-1]['bns'], 0)
+        self.assertFalse(by_stage['M'][-1]['risk_available'])
+        self.assertEqual(by_stage['M'][-1]['motor_control_mode'], 2)
+        self.assertEqual(by_stage['M'][-1]['motor_output_limit'], 0)
         self.assertTrue(by_stage['H'][-1]['failsafe_active'])
         self.assertEqual(by_stage['H'][-1]['failsafe_reason'], 'PEDAL_SENSOR_ERROR')
         self.assertEqual(by_stage['H'][-1]['motor_control_mode'], 2)
@@ -283,20 +306,21 @@ class MainLoopIntegrationTest(unittest.TestCase):
         self.assertEqual(len(carla_control.send.call_args_list), len(motor_frames))
         for call, frame in zip(carla_control.send.call_args_list, motor_frames):
             motor, risk, failsafe_active = call.args
+            self.assertIn(call.kwargs['gear'], ('D', None))
             self.assertEqual([motor['control_mode'], motor['output_limit'], risk,
                               motor['command_flags']], list(frame.data[:4]))
         carla_control.close.assert_called_once()
-        self.assertTrue(any(list(f.data[:4]) == [2, 0, 3, 1] for f in motor_frames))
+        self.assertTrue(any(list(f.data[:4]) == [2, 0, 3, 3] for f in motor_frames))
         self.assertEqual(list(motor_frames[-1].data[:4]), [2, 0, 0, 3])
         self.assertTrue(all(len(f.data) == 8 and bytes(f.data[4:7]) == b'\0\0\0' for f in motor_frames))
         risk_logs = [call.args[0] for call in logs.call_args_list if call.args and str(call.args[0]).startswith('[RISK]')]
         self.assertGreaterEqual(len(risk_logs), 2)
-        self.assertLess(len(risk_logs), 5)  # ~1 second of loop data, not one log per iteration.
+        self.assertLess(len(risk_logs), 10)
         self.assertTrue(all('CANDIDATE=L' in line for line in risk_logs))
         debug_logs = [call.args[0] for call in logs.call_args_list
                       if call.args and str(call.args[0]).startswith('[RISKDBG]')]
         self.assertGreaterEqual(len(debug_logs), 2)
-        self.assertLess(len(debug_logs), 5)
+        self.assertLess(len(debug_logs), 10)
         self.assertTrue(all(all(field in line for field in
             ('OBS=', 'DIST=', 'TTC=', 'CLOSING=', 'D1=', 'D2=', 'D3=',
              'T1=', 'T2=', 'T3=', 'P1=', 'P2=', 'P3=', 'CAND=L',

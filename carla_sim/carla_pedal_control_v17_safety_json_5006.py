@@ -8,8 +8,7 @@ import math
 import random
 import time
 import weakref
-
-from obstacle_sensing import find_path_obstacle_for_safety
+import os
 
 
 # ============================================================
@@ -19,6 +18,7 @@ from obstacle_sensing import find_path_obstacle_for_safety
 CARLA_HOST = "127.0.0.1"
 CARLA_PORT = 2000
 MAP_NAME = "Town05"
+SAFETY_PERF_REVISION = "2026-10-23-vehicle-only-80"
 
 # 주행용 Pygame 화면은 모니터 기본 해상도로 FULLSCREEN 실행
 # CARLA RGB 센서는 1920x1080으로 유지한 뒤 전체화면 크기로 확대한다.
@@ -72,11 +72,6 @@ FRONT_RADAR_HORIZONTAL_FOV = 14.0
 FRONT_RADAR_VERTICAL_FOV = 10.0
 FRONT_RADAR_POINTS_PER_SECOND = 1800
 FRONT_RADAR_SENSOR_TICK = 0.05
-# Safety corridor filtering (independent from display distance)
-SAFETY_RADAR_AZIMUTH_DEG = 4.0
-SAFETY_RADAR_ALTITUDE_DEG = 3.0
-SAFETY_RADAR_MIN_POINTS = 3
-SAFETY_RADAR_FRESHNESS_S = 0.2
 
 
 # ============================================================
@@ -175,6 +170,7 @@ FAILSAFE_TIMEOUT = 0.5
 #   "source": "CARLA",
 #   "sequence": 0,
 #   "vehicle_speed_kmh": 30.0,
+#   "gear": "D",
 #   "obstacle_id": 42,
 #   "distance_m": 15.0,
 #   "closing_speed_mps": 3.0,
@@ -185,7 +181,7 @@ FAILSAFE_TIMEOUT = 0.5
 # closing_speed_mps / ttc_s 를 모두 null 로 송신한다.
 # ============================================================
 
-RPI_IP = "192.168.0.37"
+RPI_IP = "192.168.50.2"
 RPI_TELEMETRY_PORT = 5006
 
 TELEMETRY_SEND_HZ = 10.0
@@ -200,11 +196,28 @@ UI_SEND_INTERVAL = 1.0 / UI_SEND_HZ
 # O 키 가상 야간 장애물은 실제 actor 생성 전에도
 # Safety ECU에서 동일한 장애물로 추적할 수 있도록 고정 양수 ID를 사용.
 NIGHT_SCENARIO_OBSTACLE_ID = 900001
-RADAR_OBSTACLE_ID = 900002
 
 # Safety ECU용 실제 전방 차량 탐색 범위.
 SAFETY_FRONT_MAX_DISTANCE_M = 50.0
+SAFETY_VEHICLE_ONLY = True
+SAFETY_FRONT_MAX_LOOKAHEAD_M = 120.0
+SAFETY_FRONT_LOOKAHEAD_S = 4.5
 SAFETY_FRONT_LATERAL_LIMIT_M = 2.5
+SAFETY_PATH_STEP_M = 5.0
+SAFETY_PATH_MARGIN_M = 0.25
+SAFETY_PATH_CUT_IN_SPEED_MPS = 0.4
+SAFETY_PATH_CROSSING_TTC_S = 3.0
+SAFETY_PATH_VERTICAL_MARGIN_M = 0.5
+SAFETY_PATH_DIVERGENCE_ANGLE_RAD = 0.25
+SAFETY_TARGET_DEBUG_INTERVAL_S = 2.0
+SAFETY_PATH_BRANCH_MAX_ERROR_RAD = 0.35
+SAFETY_PATH_BRANCH_MIN_SEPARATION_RAD = 0.2
+SAFETY_TARGET_HOLD_DISTANCE_M = 0.75
+SAFETY_TARGET_HOLD_TTC_S = 0.5
+SAFETY_STATIC_LABELS = ("Walls", "Fences", "GuardRail", "Static", "Poles")
+SAFETY_STATIC_GRID_M = 20.0
+SAFETY_STATIC_ID_BASE = 1_000_000_000
+SAFETY_STATIC_CACHE = {}
 
 
 # ============================================================
@@ -225,6 +238,11 @@ CREEP_TARGET_KMH = 10.0
 CREEP_MAX_THROTTLE = 0.18
 CREEP_ACCEL_DEADZONE = 0.02
 CREEP_BRAKE_DEADZONE = 0.02
+LEVEL2_SPEED_LIMIT_KMH = 30.0
+LEVEL2_SPEED_APPROACH_KMH = 5.0
+LEVEL2_SPEED_MIN_BRAKE = 0.15
+LEVEL2_SPEED_BRAKE_PER_KMH = 0.1
+GLOBAL_SPEED_LIMIT_KMH = 80.0
 
 
 # ============================================================
@@ -388,7 +406,7 @@ GEAR_CHANGE_SPEED_KMH = 1.0
 # CONTROL MODE
 # ============================================================
 
-control_mode = "HARDWARE"
+control_mode = "KEYBOARD"
 
 
 # ============================================================
@@ -398,6 +416,60 @@ control_mode = "HARDWARE"
 
 def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
+
+
+class SafetyPerfMonitor:
+    def __init__(self):
+        self.enabled = os.environ.get("PACE_PERF_PROFILE") == "1"
+        self.started = time.perf_counter()
+        self.last_frame = None
+        self.last_sim_time = None
+        self.last_location = None
+        self.frames = 0
+        self.metrics = {}
+
+    def record(self, name, started):
+        if not self.enabled:
+            return
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        count, total, maximum = self.metrics.get(name, (0, 0.0, 0.0))
+        self.metrics[name] = (count + 1, total + elapsed_ms, max(maximum, elapsed_ms))
+
+    def report(self, world, vehicle):
+        if not self.enabled:
+            return
+        self.frames += 1
+        now = time.perf_counter()
+        if self.last_frame is not None and now - self.started < 5.0:
+            return
+        snapshot_started = time.perf_counter()
+        snapshot = world.get_snapshot()
+        self.record("get_snapshot", snapshot_started)
+        sim_time = snapshot.timestamp.elapsed_seconds
+        location = vehicle.get_location()
+        if self.last_frame is not None:
+            interval = now - self.started
+            sim_interval = sim_time - self.last_sim_time
+            displacement = math.hypot(location.x - self.last_location.x,
+                                      location.y - self.last_location.y)
+            parts = [f"ego_actor_id={vehicle.id}",
+                     f"server_tick_fps={(snapshot.frame - self.last_frame) / interval:.1f}",
+                     f"client_loop_fps={self.frames / interval:.1f}",
+                     f"sim_time_ratio={sim_interval / interval:.2f}",
+                     f"displacement_m={displacement:.1f}",
+                     f"wall_displacement_kmh={displacement / interval * 3.6:.1f}",
+                     f"sim_displacement_kmh={displacement / sim_interval * 3.6:.1f}"
+                     if sim_interval > 0 else "sim_displacement_kmh=n/a",
+                     f"carla_velocity_kmh={get_speed_kmh(vehicle):.1f}"]
+            for name, (count, total, maximum) in sorted(self.metrics.items()):
+                parts.append(f"{name}={total / count:.2f}/{maximum:.2f}ms({count})")
+            print("\n[PACE PERF] " + " ".join(parts), flush=True)
+            self.metrics.clear()
+        self.last_frame = snapshot.frame
+        self.last_sim_time = sim_time
+        self.last_location = location
+        self.started = now
+        self.frames = 0
 
 
 def calculate_creep_throttle(gear, accelerator, brake, speed_kmh):
@@ -411,6 +483,17 @@ def calculate_creep_throttle(gear, accelerator, brake, speed_kmh):
         0.0, 1.0,
     )
     return CREEP_MAX_THROTTLE * ratio
+
+
+def apply_vehicle_speed_limit(control, speed_kmh):
+    speed_headroom = GLOBAL_SPEED_LIMIT_KMH - speed_kmh
+    control.throttle *= clamp(speed_headroom / LEVEL2_SPEED_APPROACH_KMH, 0.0, 1.0)
+    if speed_headroom <= 0.0:
+        control.brake = max(
+            control.brake,
+            min(1.0, LEVEL2_SPEED_MIN_BRAKE
+                - speed_headroom * LEVEL2_SPEED_BRAKE_PER_KMH),
+        )
 
 
 def median(values):
@@ -452,14 +535,431 @@ def get_forward_speed_mps(actor, reference_forward=None):
     )
 
 
+def cached_safety_box(actor, box_cache=None, profile=None):
+    actor_id = actor.id
+    if box_cache is not None and actor_id in box_cache:
+        return box_cache[actor_id]
+    started = time.perf_counter() if profile is not None else None
+    bounding_box = actor.bounding_box
+    if profile is not None:
+        profile.record("get_bounding_box", started)
+    if box_cache is not None:
+        box_cache[actor_id] = bounding_box
+    return bounding_box
+
+
+def safety_steering_geometry(vehicle):
+    try:
+        wheels = vehicle.get_physics_control().wheels
+        if len(wheels) < 4:
+            return None
+        front_x = (wheels[0].position.x + wheels[1].position.x) * 0.5
+        front_y = (wheels[0].position.y + wheels[1].position.y) * 0.5
+        rear_x = (wheels[2].position.x + wheels[3].position.x) * 0.5
+        rear_y = (wheels[2].position.y + wheels[3].position.y) * 0.5
+        wheelbase = math.hypot(front_x - rear_x, front_y - rear_y)
+        if wheelbase > 10.0:
+            wheelbase /= 100.0
+        max_angle = math.radians((wheels[0].max_steer_angle
+                                  + wheels[1].max_steer_angle) * 0.5)
+        if 1.5 <= wheelbase <= 5.0 and 0.0 < max_angle < math.pi / 2:
+            return wheelbase, max_angle
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    return None
+
+
+def safety_motion_state(actor, steer=0.0, profile=None, bounding_box=None,
+                        steering_geometry=None, transform=None):
+    if transform is None:
+        started = time.perf_counter() if profile is not None else None
+        transform = actor.get_transform()
+        if profile is not None:
+            profile.record("get_transform", started)
+    forward = transform.get_forward_vector()
+    started = time.perf_counter() if profile is not None else None
+    velocity = actor.get_velocity()
+    if profile is not None:
+        profile.record("get_velocity", started)
+    heading = math.atan2(forward.y, forward.x)
+    signed_speed = velocity.x * forward.x + velocity.y * forward.y
+    started = time.perf_counter() if profile is not None else None
+    angular_velocity = actor.get_angular_velocity() if hasattr(actor, "get_angular_velocity") else None
+    if profile is not None:
+        profile.record("get_angular_velocity", started)
+    yaw_rate = math.radians(angular_velocity.z) if angular_velocity is not None else 0.0
+    lateral_speed = -velocity.x * math.sin(heading) + velocity.y * math.cos(heading)
+    if (steering_geometry is not None and abs(yaw_rate) < 0.03
+            and signed_speed > 1.0 and abs(lateral_speed) >= SAFETY_PATH_CUT_IN_SPEED_MPS
+            and steer * lateral_speed > 0.0):
+        wheelbase, max_angle = steering_geometry
+        yaw_rate = signed_speed / wheelbase * math.tan(steer * max_angle)
+    if bounding_box is None:
+        bounding_box = cached_safety_box(actor, profile=profile)
+    offset = getattr(bounding_box, "location", None)
+    return (transform.location.x, transform.location.y, heading, signed_speed,
+            yaw_rate, velocity.x, velocity.y, velocity.z,
+            offset.x if offset is not None else 0.0,
+            offset.y if offset is not None else 0.0,
+            bounding_box.extent.x, bounding_box.extent.y)
+
+
+def predict_safety_pose(motion, seconds):
+    origin_x, origin_y, heading, signed_speed, yaw_rate, velocity_x, velocity_y, _, offset_x, offset_y, extent_x, extent_y = motion
+    future_heading = heading + yaw_rate * seconds
+    if abs(yaw_rate) > 0.001:
+        x = origin_x + signed_speed / yaw_rate * (math.sin(future_heading) - math.sin(heading))
+        y = origin_y - signed_speed / yaw_rate * (math.cos(future_heading) - math.cos(heading))
+    else:
+        x = origin_x + velocity_x * seconds
+        y = origin_y + velocity_y * seconds
+    x += offset_x * math.cos(future_heading) - offset_y * math.sin(future_heading)
+    y += offset_x * math.sin(future_heading) + offset_y * math.cos(future_heading)
+    return x, y, future_heading, extent_x, extent_y
+
+
+def safety_boxes_overlap(ego_pose, target_pose):
+    ego_x, ego_y, ego_heading, ego_length, ego_width = ego_pose
+    target_x, target_y, target_heading, target_length, target_width = target_pose
+    separation_x, separation_y = target_x - ego_x, target_y - ego_y
+    for heading in (ego_heading, target_heading):
+        for axis_x, axis_y in ((math.cos(heading), math.sin(heading)),
+                               (-math.sin(heading), math.cos(heading))):
+            separation = abs(separation_x * axis_x + separation_y * axis_y)
+            ego_projection = (ego_length * abs(math.cos(ego_heading) * axis_x + math.sin(ego_heading) * axis_y)
+                              + ego_width * abs(-math.sin(ego_heading) * axis_x + math.cos(ego_heading) * axis_y))
+            target_projection = (target_length * abs(math.cos(target_heading) * axis_x + math.sin(target_heading) * axis_y)
+                                 + target_width * abs(-math.sin(target_heading) * axis_x + math.cos(target_heading) * axis_y))
+            if separation > ego_projection + target_projection + 0.2:
+                return False
+    return True
+
+
+def safety_vertical_bounds(bounding_box, transform):
+    try:
+        vertices = bounding_box.get_world_vertices(transform)
+        return min(vertex.z for vertex in vertices), max(vertex.z for vertex in vertices)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        offset = getattr(bounding_box, "location", None)
+        center_z = transform.location.z + (getattr(offset, "z", 0.0))
+        half_height = getattr(bounding_box.extent, "z", 0.0)
+        return center_z - half_height, center_z + half_height
+
+
+def safety_future_path_occupancy(route, actor_motion, target_z, seconds,
+                                 path_width, vertical_reach):
+    future_pose = predict_safety_pose(actor_motion, seconds)
+    future_z = target_z + actor_motion[7] * seconds
+    projection = safety_path_projection(route, future_pose[0], future_pose[1], future_z)
+    return (projection is not None
+            and projection[0] <= path_width
+            and abs(future_z - projection[8]) <= vertical_reach)
+
+
+def predicted_safety_ttc(ego_poses, actor_motion, ego_z=None, target_z=None,
+                         ego_vertical_speed=0.0, vertical_reach=0.0, route=None):
+    for step, ego_pose in enumerate(ego_poses):
+        seconds = step * 0.2
+        target_pose = predict_safety_pose(actor_motion, seconds)
+        separation_x = target_pose[0] - ego_pose[0]
+        separation_y = target_pose[1] - ego_pose[1]
+        reach = (math.hypot(ego_pose[3], ego_pose[4])
+                 + math.hypot(target_pose[3], target_pose[4]) + 0.5)
+        if separation_x * separation_x + separation_y * separation_y > reach * reach:
+            continue
+        if ego_z is not None and target_z is not None:
+            future_ego_z = ego_z + ego_vertical_speed * seconds
+            if route is not None:
+                path_position = safety_path_projection(
+                    route, ego_pose[0], ego_pose[1], future_ego_z)
+                if path_position is not None:
+                    future_ego_z = path_position[8]
+            future_target_z = target_z + actor_motion[7] * seconds
+            if abs(future_target_z - future_ego_z) > vertical_reach:
+                continue
+        if safety_boxes_overlap(ego_pose, target_pose):
+            return seconds
+    return None
+
+
+def safety_waypoint_path(road_map, ego_transform, max_distance, gear, steer):
+    try:
+        waypoint = road_map.get_waypoint(ego_transform.location, project_to_road=False)
+        if waypoint is None:
+            return None
+        direction = -1.0 if gear == "R" else 1.0
+        height_offset = ego_transform.location.z - waypoint.transform.location.z
+        points = [(ego_transform.location.x, ego_transform.location.y,
+                   waypoint.road_id, waypoint.lane_id, waypoint.lane_width,
+                   ego_transform.location.z, waypoint.section_id, waypoint.lane_type)]
+        center = waypoint.transform.location
+        forward = ego_transform.get_forward_vector()
+        center_ahead = ((center.x - points[0][0]) * forward.x
+                        + (center.y - points[0][1]) * forward.y) * direction
+        if 0.25 < center_ahead < SAFETY_PATH_STEP_M:
+            points.append((center.x, center.y, waypoint.road_id,
+                           waypoint.lane_id, waypoint.lane_width,
+                           center.z + height_offset, waypoint.section_id,
+                           waypoint.lane_type))
+        traveled = 0.0
+        while traveled < max_distance:
+            choices = (waypoint.previous(SAFETY_PATH_STEP_M) if gear == "R"
+                       else waypoint.next(SAFETY_PATH_STEP_M))
+            if not choices:
+                break
+            previous_forward = waypoint.transform.get_forward_vector()
+            previous_heading = math.atan2(previous_forward.y * direction,
+                                          previous_forward.x * direction)
+            desired_turn = (math.copysign(min(0.8, abs(steer) * 1.2), steer)
+                            if abs(steer) > 0.25 else 0.0)
+
+            def branch_error(candidate):
+                candidate_forward = candidate.transform.get_forward_vector()
+                heading = math.atan2(candidate_forward.y * direction,
+                                     candidate_forward.x * direction)
+                turn = math.atan2(math.sin(heading - previous_heading),
+                                  math.cos(heading - previous_heading))
+                return abs(turn - desired_turn)
+
+            if len(choices) > 1:
+                ranked = sorted(choices, key=branch_error)
+                if (branch_error(ranked[0]) > SAFETY_PATH_BRANCH_MAX_ERROR_RAD
+                    or branch_error(ranked[1]) - branch_error(ranked[0])
+                    < SAFETY_PATH_BRANCH_MIN_SEPARATION_RAD):
+                    break
+                waypoint = ranked[0]
+            else:
+                waypoint = choices[0]
+            location = waypoint.transform.location
+            previous = points[-1]
+            step = math.hypot(location.x - previous[0], location.y - previous[1])
+            if step < 0.1:
+                break
+            traveled += step
+            points.append((location.x, location.y, waypoint.road_id,
+                           waypoint.lane_id, waypoint.lane_width,
+                           location.z + height_offset, waypoint.section_id,
+                           waypoint.lane_type))
+        return points if len(points) > 1 else None
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def safety_path_projection(points, x, y, z=None):
+    closest = None
+    traveled = 0.0
+    for start, end in zip(points, points[1:]):
+        segment_x, segment_y = end[0] - start[0], end[1] - start[1]
+        length = math.hypot(segment_x, segment_y)
+        if length < 0.1:
+            continue
+        tangent_x, tangent_y = segment_x / length, segment_y / length
+        raw_fraction = ((x - start[0]) * tangent_x
+                        + (y - start[1]) * tangent_y) / length
+        fraction = max(0.0, min(1.0, raw_fraction))
+        nearest_x = start[0] + fraction * segment_x
+        nearest_y = start[1] + fraction * segment_y
+        nearest_z = start[5] + fraction * (end[5] - start[5])
+        lateral = -(x - nearest_x) * tangent_y + (y - nearest_y) * tangent_x
+        projection = (abs(lateral), traveled + fraction * length,
+                      lateral, tangent_x, tangent_y, end[2], end[3], end[4],
+                      nearest_z, start[2], start[3], start[6], end[6],
+                      start[7], end[7], max(0.0, raw_fraction - 1.0) * length)
+        separation = (x - nearest_x) ** 2 + (y - nearest_y) ** 2
+        if z is not None:
+            separation += (z - nearest_z) ** 2
+        if closest is None or separation < closest_separation:
+            closest = projection
+            closest_separation = separation
+        traveled += length
+    return closest
+
+
+def safety_path_connected(projection, waypoint):
+    if waypoint is None or projection is None:
+        return False
+    if waypoint.lane_type not in (projection[13], projection[14]):
+        return False
+    return ((waypoint.road_id, waypoint.section_id, waypoint.lane_id)
+            in ((projection[9], projection[11], projection[10]),
+                (projection[5], projection[12], projection[6])))
+
+
+def safety_static_grid(world, road_map):
+    cache_key = (id(world), getattr(road_map, "name", None))
+    if cache_key in SAFETY_STATIC_CACHE:
+        return SAFETY_STATIC_CACHE[cache_key]
+    grid = {}
+    seen = set()
+    city_labels = getattr(globals().get("carla"), "CityObjectLabel", None)
+    for label_name in SAFETY_STATIC_LABELS:
+        label = getattr(city_labels, label_name, None)
+        if label is None:
+            continue
+        try:
+            objects = world.get_environment_objects(label)
+        except (AttributeError, RuntimeError):
+            continue
+        for obj in objects:
+            object_id = getattr(obj, "id", None)
+            if type(object_id) is not int or object_id < 0 or object_id in seen:
+                continue
+            seen.add(object_id)
+            box = obj.bounding_box
+            center = box.location
+            extent = box.extent
+            if min(extent.x, extent.y, extent.z) <= 0.0:
+                continue
+            radius = math.hypot(extent.x, extent.y)
+            entry = (SAFETY_STATIC_ID_BASE + object_id, center.x, center.y,
+                     center.z - extent.z, center.z + extent.z,
+                     math.radians(box.rotation.yaw), extent.x, extent.y)
+            for cell_x in range(math.floor((center.x - radius) / SAFETY_STATIC_GRID_M),
+                                math.floor((center.x + radius) / SAFETY_STATIC_GRID_M) + 1):
+                for cell_y in range(math.floor((center.y - radius) / SAFETY_STATIC_GRID_M),
+                                    math.floor((center.y + radius) / SAFETY_STATIC_GRID_M) + 1):
+                    grid.setdefault((cell_x, cell_y), []).append(entry)
+    SAFETY_STATIC_CACHE.clear()
+    SAFETY_STATIC_CACHE[cache_key] = grid
+    return grid
+
+
+def safety_route_pose(points, distance, ego_width, ego_length):
+    traveled = 0.0
+    for start, end in zip(points, points[1:]):
+        segment_x, segment_y = end[0] - start[0], end[1] - start[1]
+        length = math.hypot(segment_x, segment_y)
+        if length < 0.1:
+            continue
+        if traveled + length >= distance:
+            fraction = max(0.0, min(1.0, (distance - traveled) / length))
+            return (start[0] + fraction * segment_x,
+                    start[1] + fraction * segment_y,
+                    math.atan2(segment_y, segment_x), ego_length, ego_width,
+                    start[5] + fraction * (end[5] - start[5]))
+        traveled += length
+    return None
+
+
+def find_static_obstacle_for_safety(world, road_map, route, ego_transform,
+                                    ego_box, ego_z_min, ego_z_max, max_distance,
+                                    ego_speed_mps):
+    if route is None:
+        return None
+    grid = safety_static_grid(world, road_map)
+    location = ego_transform.location
+    radius_cells = math.ceil(max_distance / SAFETY_STATIC_GRID_M) + 1
+    ego_cell_x = math.floor(location.x / SAFETY_STATIC_GRID_M)
+    ego_cell_y = math.floor(location.y / SAFETY_STATIC_GRID_M)
+    seen = set()
+    selected = None
+    for cell_x in range(ego_cell_x - radius_cells, ego_cell_x + radius_cells + 1):
+        for cell_y in range(ego_cell_y - radius_cells, ego_cell_y + radius_cells + 1):
+            for entry in grid.get((cell_x, cell_y), ()):
+                object_id, x, y, z_min, z_max, heading, length, width = entry
+                if object_id in seen:
+                    continue
+                seen.add(object_id)
+                reach = math.hypot(length, width)
+                if math.hypot(x - location.x, y - location.y) > max_distance + reach:
+                    continue
+                projection = safety_path_projection(route, x, y, (z_min + z_max) * 0.5)
+                if projection is None or projection[1] <= 0.0:
+                    continue
+                if projection[0] > reach + ego_box.extent.y + SAFETY_PATH_MARGIN_M:
+                    continue
+                target_pose = (x, y, heading, length, width)
+                first_distance = max(0.0, projection[1] - reach - ego_box.extent.x)
+                last_distance = min(max_distance, projection[1] + reach + ego_box.extent.x)
+                sample_distance = first_distance
+                while sample_distance <= last_distance:
+                    pose = safety_route_pose(route, sample_distance,
+                                             ego_box.extent.y, ego_box.extent.x)
+                    if pose is None:
+                        break
+                    path_z_offset = pose[5] - location.z
+                    height_overlap = (
+                        z_min <= ego_z_max + path_z_offset + SAFETY_PATH_VERTICAL_MARGIN_M
+                        and z_max >= ego_z_min + path_z_offset - SAFETY_PATH_VERTICAL_MARGIN_M
+                    )
+                    if height_overlap and safety_boxes_overlap(pose[:5], target_pose):
+                        gap = max(0.0, sample_distance - ego_box.extent.x)
+                        candidate = {
+                            "actor": None,
+                            "obstacle_id": object_id,
+                            "distance_m": gap,
+                            "closing_speed_mps": max(0.0, ego_speed_mps),
+                            "ttc_s": gap / ego_speed_mps if ego_speed_mps > 0.01 else None,
+                        }
+                        if selected is None or gap < selected["distance_m"]:
+                            selected = candidate
+                        break
+                    sample_distance += 1.0
+    return selected
+
+
+def safety_candidate_id(candidate):
+    return (candidate["obstacle_id"] if candidate.get("obstacle_id") is not None
+            else candidate["actor"].id)
+
+
+_safety_target_debug_seen = {}
+
+
+def safety_target_debug(candidate):
+    now = time.monotonic()
+    key = (candidate["actor_id"], candidate["reason"])
+    if now - _safety_target_debug_seen.get(key, -float("inf")) < SAFETY_TARGET_DEBUG_INTERVAL_S:
+        return
+    if len(_safety_target_debug_seen) > 256:
+        _safety_target_debug_seen.clear()
+    _safety_target_debug_seen[key] = now
+    print("[SAFETY TARGET] ego={ego_lane} id={actor_id} xyz={position} "
+          "road/lane={road_lane} route={route_lane} heading={heading_deg} "
+          "heading_delta={heading_delta_deg} path_distance={path_distance_m} "
+          "dz={height_delta} connected={connected} occupies={on_path} "
+          "kind={kind} decision={reason} source=CARLA_5006".format(**candidate), flush=True)
+
+
+def draw_safety_route_debug(world, ego_vehicle, road_map, gear, steer, target_id):
+    route = safety_waypoint_path(road_map, ego_vehicle.get_transform(),
+                                SAFETY_FRONT_MAX_LOOKAHEAD_M, gear, steer)
+    if route is not None:
+        for start, end in zip(route, route[1:]):
+            world.debug.draw_line(
+                carla.Location(x=start[0], y=start[1], z=start[5] + 0.3),
+                carla.Location(x=end[0], y=end[1], z=end[5] + 0.3),
+                thickness=0.12, color=carla.Color(0, 255, 0), life_time=0.2)
+    if target_id is None or target_id == NIGHT_SCENARIO_OBSTACLE_ID:
+        return
+    target = world.get_actor(target_id)
+    if target is None:
+        return
+    vertices = target.bounding_box.get_world_vertices(target.get_transform())
+    for start, end in ((0, 1), (1, 3), (3, 2), (2, 0),
+                       (4, 5), (5, 7), (7, 6), (6, 4),
+                       (0, 4), (1, 5), (2, 6), (3, 7)):
+        world.debug.draw_line(vertices[start], vertices[end], thickness=0.1,
+                              color=carla.Color(255, 0, 0), life_time=0.2)
+
+
 def find_front_vehicle_for_safety(
     world,
     ego_vehicle,
     max_distance=SAFETY_FRONT_MAX_DISTANCE_M,
     lateral_limit=SAFETY_FRONT_LATERAL_LIMIT_M,
+    gear="D",
+    steer=0.0,
+    profile=None,
+    actors=None,
+    box_cache=None,
+    road_map=None,
+    debug=None,
+    preferred_target_id=None,
+    steering_geometry=None,
 ):
     """
-    Find the closest real vehicle in the ego-forward corridor.
+    Find the closest vehicle or pedestrian in the selected travel corridor.
 
     Returns None or:
     {
@@ -472,28 +972,90 @@ def find_front_vehicle_for_safety(
     This is intentionally actor-based instead of radar-point-based so the
     Safety ECU receives a stable obstacle_id.
     """
+    find_started = time.perf_counter() if profile is not None else None
     ego_transform = ego_vehicle.get_transform()
+    ego_id = ego_vehicle.id
     ego_location = ego_transform.location
     ego_forward = ego_transform.get_forward_vector()
     ego_right = ego_transform.get_right_vector()
+    ego_heading = math.atan2(ego_forward.y, ego_forward.x)
+    direction = -1.0 if gear == "R" else 1.0
     ego_velocity_forward = get_forward_speed_mps(
         ego_vehicle,
         ego_forward,
-    )
+    ) * direction
 
+    ego_box = cached_safety_box(ego_vehicle, box_cache, profile)
+    ego_z_min, ego_z_max = safety_vertical_bounds(ego_box, ego_transform)
+    ego_center_z = (ego_z_min + ego_z_max) * 0.5
     ego_front_extent = max(
         0.0,
-        float(ego_vehicle.bounding_box.extent.x),
+        float(ego_box.extent.x),
     )
 
     closest = None
+    preferred = None
+    ego_poses = None
+    ego_motion = None
+    if steering_geometry is None and abs(steer) > 0.05:
+        steering_geometry = safety_steering_geometry(ego_vehicle)
+    debug_candidates = [] if debug is not None else None
 
-    for actor in world.get_actors().filter("vehicle.*"):
-        if actor.id == ego_vehicle.id:
+    if road_map is None:
+        try:
+            road_map = world.get_map()
+        except (AttributeError, RuntimeError):
+            road_map = None
+    route_started = time.perf_counter() if profile is not None else None
+    route = (safety_waypoint_path(road_map, ego_transform, max_distance, gear, steer)
+             if road_map is not None else None)
+    if profile is not None:
+        profile.record("safety_path", route_started)
+    ego_lane_change = False
+    if route is not None:
+        tangent_start = 1 if len(route) > 2 else 0
+        tangent_x = route[tangent_start + 1][0] - route[tangent_start][0]
+        tangent_y = route[tangent_start + 1][1] - route[tangent_start][1]
+        tangent_length = math.hypot(tangent_x, tangent_y)
+        if tangent_length > 0.1:
+            velocity = ego_vehicle.get_velocity()
+            lateral_speed = (-velocity.x * tangent_y + velocity.y * tangent_x) / tangent_length
+            ego_lane_change = abs(steer) > 0.1 and abs(lateral_speed) >= SAFETY_PATH_CUT_IN_SPEED_MPS
+
+    if actors is None:
+        started = time.perf_counter() if profile is not None else None
+        actors = world.get_actors()
+        if profile is not None:
+            profile.record("get_actors", started)
+    if box_cache is not None:
+        live_ids = {actor.id for actor in actors}
+        for actor_id in box_cache.keys() - live_ids:
+            del box_cache[actor_id]
+    for actor in actors:
+        started = time.perf_counter() if profile is not None else None
+        actor_type = actor.type_id
+        if profile is not None:
+            profile.record("get_actor_type", started)
+        if not actor_type.startswith("vehicle.") and (SAFETY_VEHICLE_ONLY
+                or not actor_type.startswith("walker.pedestrian.")):
+            continue
+        if actor.id == ego_id:
             continue
 
+        location = None
+        actor_waypoint = None
+        projection = None
+        connected = False
+        on_path = False
+        actor_motion = None
+        kind = None
+        dz = None
+        reason = "candidate"
         try:
+            started = time.perf_counter() if profile is not None else None
             location = actor.get_location()
+            if profile is not None:
+                profile.record("get_location", started)
 
             dx = location.x - ego_location.x
             dy = location.y - ego_location.y
@@ -503,7 +1065,7 @@ def find_front_vehicle_for_safety(
                 dx * ego_forward.x
                 + dy * ego_forward.y
                 + dz * ego_forward.z
-            )
+            ) * direction
 
             lateral = (
                 dx * ego_right.x
@@ -511,16 +1073,10 @@ def find_front_vehicle_for_safety(
                 + dz * ego_right.z
             )
 
-            # Behind ego or clearly outside the ego path.
-            if longitudinal <= 0.0:
-                continue
-
-            if abs(lateral) > lateral_limit:
-                continue
-
+            actor_box = cached_safety_box(actor, box_cache, profile)
             target_half_length = max(
                 0.0,
-                float(actor.bounding_box.extent.x),
+                float(actor_box.extent.x),
             )
 
             bumper_gap = max(
@@ -530,128 +1086,177 @@ def find_front_vehicle_for_safety(
                 - target_half_length,
             )
 
-            if bumper_gap > max_distance:
+            if math.hypot(dx, dy) > max_distance + ego_front_extent + target_half_length:
+                reason = "out_of_range"
                 continue
 
-            target_velocity_forward = get_forward_speed_mps(
-                actor,
-                ego_forward,
+            projection = (safety_path_projection(route, location.x, location.y, location.z)
+                          if route is not None else None)
+            if projection is None and longitudinal <= 0.0:
+                reason = "behind"
+                continue
+            fallback_off_path = (projection is None and abs(lateral)
+                                 > min(lateral_limit,
+                                       ego_box.extent.y + actor_box.extent.y
+                                       + SAFETY_PATH_MARGIN_M))
+
+            actor_transform = actor.get_transform()
+            target_z_min, target_z_max = safety_vertical_bounds(actor_box, actor_transform)
+            target_center_z = (target_z_min + target_z_max) * 0.5
+            vertical_reach = ((ego_z_max - ego_z_min + target_z_max - target_z_min) * 0.5
+                              + SAFETY_PATH_VERTICAL_MARGIN_M)
+            path_center_z = projection[8] if projection is not None else ego_center_z
+            path_offset_z = path_center_z - ego_location.z if projection is not None else 0.0
+            vertical_overlap = (
+                target_z_min <= ego_z_max + path_offset_z + SAFETY_PATH_VERTICAL_MARGIN_M
+                and target_z_max >= ego_z_min + path_offset_z - SAFETY_PATH_VERTICAL_MARGIN_M
             )
 
-            closing_speed = (
-                ego_velocity_forward
-                - target_velocity_forward
-            )
+            actor_motion = safety_motion_state(actor, profile=profile,
+                                               bounding_box=actor_box,
+                                               transform=actor_transform)
+            if projection is not None:
+                path_width = ego_box.extent.y + actor_box.extent.y + SAFETY_PATH_MARGIN_M
+                beyond_route = projection[15] > target_half_length
+                on_path = (vertical_overlap and projection[0] <= path_width
+                           and not beyond_route
+                           and (projection[1] > 0.0 or longitudinal > -target_half_length))
+                if actor_type.startswith("vehicle."):
+                    try:
+                        actor_waypoint = road_map.get_waypoint(location, project_to_road=False)
+                    except RuntimeError:
+                        actor_waypoint = None
+                    connected = safety_path_connected(projection, actor_waypoint)
+                if not on_path:
+                    lateral_velocity = (-actor_motion[5] * projection[4]
+                                        + actor_motion[6] * projection[3])
+                    moving_toward_path = (
+                        -lateral_velocity * math.copysign(1.0, projection[2])
+                        >= SAFETY_PATH_CUT_IN_SPEED_MPS
+                    ) if abs(projection[2]) > 0.01 else False
+                    if (not moving_toward_path and not ego_lane_change
+                        and not beyond_route and not vertical_overlap):
+                        reason = "height_separation"
+                        continue
+                    if not moving_toward_path and not ego_lane_change and not beyond_route:
+                        reason = "different_lane_or_route"
+                        continue
 
-            if closing_speed > 0.0:
-                ttc = bumper_gap / closing_speed
+            if ego_poses is None:
+                ego_motion = safety_motion_state(ego_vehicle, steer=steer,
+                                                 profile=profile, bounding_box=ego_box,
+                                                 steering_geometry=steering_geometry)
+                ego_poses = [predict_safety_pose(ego_motion, step * 0.2)
+                             for step in range(31)]
+            prediction_started = time.perf_counter() if profile is not None else None
+            ttc = predicted_safety_ttc(
+                ego_poses, actor_motion, ego_center_z, target_center_z,
+                ego_motion[7], vertical_reach, route)
+            if profile is not None:
+                profile.record("predicted_ttc", prediction_started)
+
+            if ttc is None and projection is not None and on_path:
+                route_heading = math.atan2(projection[4], projection[3])
+                heading_error = math.atan2(
+                    math.sin(actor_motion[2] - route_heading),
+                    math.cos(actor_motion[2] - route_heading),
+                )
+                diverging_motion = (
+                    abs(heading_error) > SAFETY_PATH_DIVERGENCE_ANGLE_RAD
+                    or abs(actor_motion[4]) * 2.0 > SAFETY_PATH_DIVERGENCE_ANGLE_RAD
+                    or abs(actor_motion[7]) >= SAFETY_PATH_CUT_IN_SPEED_MPS
+                )
+                if (not safety_future_path_occupancy(
+                    route, actor_motion, target_center_z, 2.0,
+                    path_width, vertical_reach,
+                ) and diverging_motion
+                    and bumper_gap > max(2.0, ego_velocity_forward * 0.5)):
+                    reason = "diverging_path_or_height"
+                    continue
+
+            if ttc is None and projection is None and abs(actor_motion[4]) > 0.15:
+                future_pose = predict_safety_pose(actor_motion, 2.0)
+                future_lateral = ((future_pose[0] - ego_location.x) * ego_right.x
+                                  + (future_pose[1] - ego_location.y) * ego_right.y)
+                if (abs(future_lateral) > ego_box.extent.y + actor_box.extent.y
+                    and bumper_gap > max(2.0, ego_velocity_forward * 0.5)):
+                    reason = "diverging_path"
+                    continue
+
+            if projection is not None and not on_path:
+                if ttc is None or ttc > SAFETY_PATH_CROSSING_TTC_S:
+                    reason = "height_separation" if not vertical_overlap else "different_lane_or_route"
+                    continue
+                future_target = predict_safety_pose(actor_motion, ttc)
+                future_projection = safety_path_projection(
+                    route, future_target[0], future_target[1],
+                    target_center_z + actor_motion[7] * ttc)
+                if (future_projection is None or future_projection[1] <= 0.0
+                    or (future_projection[0] > path_width and not ego_lane_change)):
+                    reason = "future_path_miss"
+                    continue
+                projection = future_projection
+
+            if projection is not None:
+                path_forward_x, path_forward_y = projection[3], projection[4]
+                target_velocity_forward = (actor_motion[5] * path_forward_x
+                                           + actor_motion[6] * path_forward_y)
+                ego_velocity_on_path = (ego_motion[5] * path_forward_x
+                                        + ego_motion[6] * path_forward_y)
+                closing_speed = ego_velocity_on_path - target_velocity_forward
+                heading_offset = actor_motion[2] - math.atan2(path_forward_y, path_forward_x)
+                if (ttc is None and actor_type.startswith("vehicle.")
+                    and abs(math.cos(heading_offset)) < 0.85):
+                    reason = "crossing_without_collision"
+                    continue
+                target_reach = (abs(math.cos(heading_offset)) * actor_box.extent.x
+                                + abs(math.sin(heading_offset)) * actor_box.extent.y)
+                bumper_gap = max(0.0, projection[1] - ego_front_extent - target_reach)
+                if on_path and ego_lane_change and ttc is None and ego_velocity_forward > 0.0:
+                    travel_time = min(3.0, bumper_gap / ego_velocity_forward)
+                    future_ego = predict_safety_pose(ego_motion, travel_time)
+                    future_route = safety_path_projection(
+                        route, future_ego[0], future_ego[1])
+                    if future_route is not None and future_route[0] > path_width:
+                        reason = "ego_route_departure"
+                        continue
+                if not on_path:
+                    closing_speed = bumper_gap / max(ttc, 0.2)
+                elif closing_speed > 0.01:
+                    route_ttc = bumper_gap / closing_speed
+                    if (ttc is not None or safety_future_path_occupancy(
+                        route, actor_motion, target_center_z,
+                        min(route_ttc, 6.0), path_width, vertical_reach,
+                    )):
+                        ttc = min(ttc, route_ttc) if ttc is not None else route_ttc
+                if ttc == 0.0 and closing_speed < -0.1:
+                    reason = "receding"
+                    continue
+                if closing_speed < -0.5 and ttc is None:
+                    reason = "receding"
+                    continue
             else:
-                ttc = None
-
-            candidate = {
-                "actor": actor,
-                "distance_m": float(bumper_gap),
-                "closing_speed_mps": float(closing_speed),
-                "ttc_s": (
-                    float(ttc)
-                    if ttc is not None
-                    else None
-                ),
-            }
-
-            if (
-                closest is None
-                or candidate["distance_m"]
-                < closest["distance_m"]
-            ):
-                closest = candidate
-
-        except RuntimeError:
-            # Actor may disappear between world snapshot and property access.
-            continue
-
-    return closest
-
-
-def find_rear_vehicle_for_safety(
-    world,
-    ego_vehicle,
-    max_distance=SAFETY_FRONT_MAX_DISTANCE_M,
-    lateral_limit=SAFETY_FRONT_LATERAL_LIMIT_M,
-):
-    """Find the closest vehicle in the ego-rear corridor."""
-    ego_transform = ego_vehicle.get_transform()
-    ego_location = ego_transform.location
-    ego_forward = ego_transform.get_forward_vector()
-    ego_right = ego_transform.get_right_vector()
-
-    ego_velocity_forward = get_forward_speed_mps(
-        ego_vehicle, ego_forward
-    )
-    ego_rear_extent = max(
-        0.0, float(ego_vehicle.bounding_box.extent.x)
-    )
-
-    closest = None
-
-    for actor in world.get_actors().filter("vehicle.*"):
-        if actor.id == ego_vehicle.id:
-            continue
-
-        try:
-            location = actor.get_location()
-
-            dx = location.x - ego_location.x
-            dy = location.y - ego_location.y
-            dz = location.z - ego_location.z
-
-            longitudinal = (
-                dx * ego_forward.x
-                + dy * ego_forward.y
-                + dz * ego_forward.z
-            )
-            lateral = (
-                dx * ego_right.x
-                + dy * ego_right.y
-                + dz * ego_right.z
-            )
-
-            # Ignore vehicles in front or outside the rear corridor.
-            if longitudinal >= 0.0:
-                continue
-
-            if abs(lateral) > lateral_limit:
-                continue
-
-            target_half_length = max(
-                0.0, float(actor.bounding_box.extent.x)
-            )
-
-            bumper_gap = max(
-                0.0,
-                -longitudinal
-                - ego_rear_extent
-                - target_half_length,
-            )
-
-            if bumper_gap > max_distance:
-                continue
-
-            target_velocity_forward = get_forward_speed_mps(
-                actor, ego_forward
-            )
-
-            # Positive when the rear gap is closing.
-            closing_speed = (
-                target_velocity_forward
-                - ego_velocity_forward
-            )
-
-            ttc = (
-                bumper_gap / closing_speed
-                if closing_speed > 0.0
-                else None
-            )
+                if fallback_off_path and (ttc is None or ttc > SAFETY_PATH_CROSSING_TTC_S):
+                    reason = "different_lane_or_route"
+                    continue
+                if not vertical_overlap and ttc is None:
+                    reason = "height_separation"
+                    continue
+                target_velocity_forward = (
+                    actor_motion[5] * ego_forward.x
+                    + actor_motion[6] * ego_forward.y
+                    + actor_motion[7] * ego_forward.z
+                ) * direction
+                closing_speed = ego_velocity_forward - target_velocity_forward
+                if ttc is None:
+                    if (not actor_type.startswith("vehicle.")
+                        or closing_speed < -0.5
+                        or math.cos(actor_motion[2] - ego_motion[2]) < 0.85):
+                        reason = "non_closing"
+                        continue
+                if ttc == 0.0 and closing_speed < -0.1:
+                    reason = "receding"
+                    continue
 
             candidate = {
                 "actor": actor,
@@ -659,41 +1264,69 @@ def find_rear_vehicle_for_safety(
                 "closing_speed_mps": float(closing_speed),
                 "ttc_s": float(ttc) if ttc is not None else None,
             }
-
-            if (
-                closest is None
-                or candidate["distance_m"] < closest["distance_m"]
-            ):
+            kind = "following" if on_path else "intrusion" if route is not None else "unmapped"
+            if closest is None or candidate["distance_m"] < closest["distance_m"]:
                 closest = candidate
+            if actor.id == preferred_target_id:
+                preferred = candidate
+            reason = "valid_candidate"
 
         except RuntimeError:
-            continue
+            # Actor may disappear between world snapshot and property access.
+            reason = "actor_unavailable"
+        finally:
+            if debug_candidates is not None:
+                debug_candidates.append({
+                    "ego_lane": ((route[0][2], route[0][6], route[0][3])
+                                 if route is not None else None),
+                    "actor_id": actor.id,
+                    "position": ((round(location.x, 2), round(location.y, 2), round(location.z, 2))
+                                 if location is not None else None),
+                    "height_delta": round(dz, 2) if dz is not None else None,
+                    "heading_deg": (round(math.degrees(actor_motion[2]), 1)
+                                    if actor_motion is not None else None),
+                    "heading_delta_deg": (round(math.degrees(math.atan2(
+                        math.sin(actor_motion[2] - ego_heading),
+                        math.cos(actor_motion[2] - ego_heading))), 1)
+                                          if actor_motion is not None else None),
+                    "path_distance_m": (round(projection[1], 2)
+                                        if projection is not None else None),
+                    "road_lane": ((actor_waypoint.road_id, actor_waypoint.section_id,
+                                   actor_waypoint.lane_id) if actor_waypoint is not None else None),
+                    "route_lane": ((projection[5], projection[12], projection[6])
+                                   if projection is not None else None),
+                    "connected": connected,
+                    "on_path": on_path,
+                    "kind": kind,
+                    "reason": reason,
+                })
 
+    if not SAFETY_VEHICLE_ONLY:
+        static_candidate = find_static_obstacle_for_safety(
+            world, road_map, route, ego_transform, ego_box, ego_z_min, ego_z_max,
+            max_distance, ego_velocity_forward)
+        if static_candidate is not None:
+            if closest is None or static_candidate["distance_m"] < closest["distance_m"]:
+                closest = static_candidate
+            if safety_candidate_id(static_candidate) == preferred_target_id:
+                preferred = static_candidate
+
+    if (closest is not None and preferred is not None
+            and preferred["distance_m"] <= closest["distance_m"] + SAFETY_TARGET_HOLD_DISTANCE_M
+            and (closest["ttc_s"] is None
+                 or (preferred["ttc_s"] is not None
+                     and preferred["ttc_s"] <= closest["ttc_s"] + SAFETY_TARGET_HOLD_TTC_S))):
+        closest = preferred
+    if debug_candidates is not None:
+        for record in debug_candidates:
+            if record["reason"] == "valid_candidate":
+                record["reason"] = ("selected" if closest is not None
+                                    and record["actor_id"] == safety_candidate_id(closest)
+                                    else "farther_candidate")
+            debug(record)
+    if profile is not None:
+        profile.record("safety_find", find_started)
     return closest
-
-
-
-def find_extra_obstacle_for_safety(world, ego_vehicle, gear):
-    """Find pedestrian or static obstacles without replacing vehicle tracking."""
-    if gear not in ("D", "R"):
-        return None
-
-    try:
-        result = find_path_obstacle_for_safety(
-            carla,
-            world,
-            ego_vehicle,
-            max_distance=SAFETY_FRONT_MAX_DISTANCE_M,
-            reverse=(gear == "R"),
-            kinds=("walker", "static"),
-        )
-    except (RuntimeError, ValueError, TypeError, AttributeError):
-        return None
-
-    if result is None or result.get("kind") not in ("walker", "static"):
-        return None
-
-    return result
 
 
 def build_safety_telemetry(
@@ -704,41 +1337,68 @@ def build_safety_telemetry(
     virtual_obstacle_distance,
     virtual_obstacle_materialized=False,
     gear="D",
-    front_distance_sensor=None,
+    steer=0.0,
+    escape_target_id=None,
+    profile=None,
+    box_cache=None,
+    road_map=None,
+    debug=None,
+    steering_geometry=None,
 ):
     """Create the exact JSON object expected by Pi Safety ECU."""
+    started = time.perf_counter() if profile is not None else None
     vehicle_speed_kmh = max(
         0.0,
         float(get_speed_kmh(ego_vehicle)),
     )
+    if profile is not None:
+        profile.record("build_vehicle_speed", started)
 
     obstacle_id = None
     distance_m = None
     closing_speed_mps = None
     ttc_s = None
-
-    # Read front Radar distance.
-    # This value is not used for Safety decisions yet.
-    radar_distance_m = None
-
-    if gear == "D" and front_distance_sensor is not None:
-        radar_distance_m = front_distance_sensor.get_safety_corridor_distance()
-
-        if radar_distance_m is not None:
-            radar_distance_m = float(radar_distance_m)
-
-            if not math.isfinite(radar_distance_m):
-                radar_distance_m = None
-
-            elif not 0.0 <= radar_distance_m <= FRONT_DISTANCE_RANGE:
-                radar_distance_m = None
+    started = time.perf_counter() if profile is not None else None
+    signed_speed_mps = float(get_forward_speed_mps(
+        ego_vehicle, ego_vehicle.get_transform().get_forward_vector(),
+    ))
+    if profile is not None:
+        profile.record("build_signed_speed", started)
+    escape_distance_m = None
+    tracked_actors = None
+    if escape_target_id is not None:
+        escape_started = time.perf_counter() if profile is not None else None
+        started = time.perf_counter() if profile is not None else None
+        tracked_actors = world.get_actors()
+        if profile is not None:
+            profile.record("get_actors", started)
+        started = time.perf_counter() if profile is not None else None
+        previous_actor = next((actor for actor in tracked_actors
+                               if actor.id == escape_target_id), None)
+        if profile is not None:
+            profile.record("escape_lookup", started)
+        if previous_actor is not None:
+            previous_location = previous_actor.get_location()
+            ego_location = ego_vehicle.get_location()
+            center_distance = math.hypot(previous_location.x - ego_location.x,
+                                         previous_location.y - ego_location.y)
+            ego_box = cached_safety_box(ego_vehicle, box_cache, profile)
+            previous_box = cached_safety_box(previous_actor, box_cache, profile)
+            escape_distance_m = max(0.0, center_distance
+                                    - ego_box.extent.x
+                                    - previous_box.extent.x)
+        if profile is not None:
+            profile.record("build_escape", escape_started)
 
     # Virtual preview is valid only before the real obstacle is spawned.
     # After handoff, use current actor detection, including an absent obstacle.
     # A consumed zero-distance preview must never remain latched after collision.
     if (
+        not SAFETY_VEHICLE_ONLY
+        and
         gear == "D"
-        and virtual_obstacle_active
+        and
+        virtual_obstacle_active
         and virtual_obstacle_distance is not None
         and virtual_obstacle_distance > 0.0
         and not virtual_obstacle_materialized
@@ -772,66 +1432,44 @@ def build_safety_telemetry(
                 / closing_speed_mps
             )
 
-
     else:
-        candidates = []
-        detected_vehicle = None
+        front_vehicle = find_front_vehicle_for_safety(
+            world,
+            ego_vehicle,
+            max_distance=max(
+                SAFETY_FRONT_MAX_DISTANCE_M,
+                min(SAFETY_FRONT_MAX_LOOKAHEAD_M,
+                    vehicle_speed_kmh / 3.6 * SAFETY_FRONT_LOOKAHEAD_S),
+            ),
+            gear=gear,
+            steer=steer,
+            profile=profile,
+            actors=tracked_actors,
+            box_cache=box_cache,
+            road_map=road_map,
+            debug=debug,
+            preferred_target_id=escape_target_id,
+            steering_geometry=steering_geometry,
+        )
 
-        if gear == "D":
-            detected_vehicle = find_front_vehicle_for_safety(
-                world,
-                ego_vehicle,
+        if front_vehicle is not None:
+            obstacle_id = int(safety_candidate_id(front_vehicle))
+            distance_m = float(
+                front_vehicle["distance_m"]
             )
-        elif gear == "R":
-            detected_vehicle = find_rear_vehicle_for_safety(
-                world,
-                ego_vehicle,
+            closing_speed_mps = float(
+                front_vehicle["closing_speed_mps"]
             )
-
-        if detected_vehicle is not None:
-            candidates.append({
-                "obstacle_id": int(detected_vehicle["actor"].id),
-                "distance_m": float(detected_vehicle["distance_m"]),
-                "closing_speed_mps": float(detected_vehicle["closing_speed_mps"]),
-                "ttc_s": detected_vehicle["ttc_s"],
-            })
-
-        extra_obstacle = find_extra_obstacle_for_safety(world, ego_vehicle, gear)
-        if extra_obstacle is not None:
-            candidates.append(extra_obstacle)
-
-        if gear == "D" and radar_distance_m is not None:
-            ego_forward = ego_vehicle.get_transform().get_forward_vector()
-            radar_closing = max(
-                0.0,
-                float(get_forward_speed_mps(ego_vehicle, ego_forward)),
-            )
-            candidates.append({
-                "obstacle_id": RADAR_OBSTACLE_ID,
-                "distance_m": radar_distance_m,
-                "closing_speed_mps": radar_closing,
-                "ttc_s": radar_distance_m / radar_closing if radar_closing > 0.0 else None,
-            })
-
-        if candidates:
-            selected = min(
-                candidates,
-                key=lambda target: (
-                    target["distance_m"],
-                    target["ttc_s"] if target["ttc_s"] is not None else math.inf,
-                ),
-            )
-            obstacle_id = int(selected["obstacle_id"])
-            distance_m = float(selected["distance_m"])
-            closing_speed_mps = float(selected["closing_speed_mps"])
-            ttc_s = selected["ttc_s"]
-
-
+            ttc_s = front_vehicle["ttc_s"]
 
     return {
         "source": "CARLA",
         "sequence": int(sequence) & 0xFFFF,
         "vehicle_speed_kmh": vehicle_speed_kmh,
+        "gear": gear,
+        "signed_speed_mps": signed_speed_mps,
+        "escape_obstacle_id": escape_target_id if escape_distance_m is not None else None,
+        "escape_distance_m": escape_distance_m,
         "obstacle_id": obstacle_id,
         "distance_m": distance_m,
         "closing_speed_mps": closing_speed_mps,
@@ -1507,10 +2145,6 @@ class FrontDistanceSensor:
         # 충돌 직후 잠깐 0.00 m를 유지
         self.collision_zero_until = 0.0
 
-        # Independent safety-corridor Radar measurement
-        self.safety_corridor_distance = None
-        self.last_safety_valid_time = 0.0
-
         bbox = self.parent.bounding_box
 
         # ----------------------------------------------------
@@ -1642,41 +2276,16 @@ class FrontDistanceSensor:
         now = time.monotonic()
 
         valid_depths = []
-        safety_depths = []
 
         for detection in radar_data:
             depth = float(detection.depth)
 
-            if not math.isfinite(depth):
-                continue
-
-            if 0.02 < depth <= FRONT_DISTANCE_RANGE:
-                # Existing display-distance processing
+            if (
+                0.02
+                < depth
+                <= FRONT_DISTANCE_RANGE
+            ):
                 valid_depths.append(depth)
-
-                # Safety corridor: only returns near the forward centerline
-                azimuth_deg = math.degrees(float(detection.azimuth))
-                altitude_deg = math.degrees(float(detection.altitude))
-
-                if (
-                    math.isfinite(azimuth_deg)
-                    and math.isfinite(altitude_deg)
-                    and abs(azimuth_deg) <= SAFETY_RADAR_AZIMUTH_DEG
-                    and abs(altitude_deg) <= SAFETY_RADAR_ALTITUDE_DEG
-                ):
-                    safety_depths.append(depth)
-
-        # Safety measurement is independent from the display filter.
-        # Do not retain an old detection when this frame has no valid target.
-        if len(safety_depths) >= SAFETY_RADAR_MIN_POINTS:
-            safety_depths.sort()
-
-            self.safety_corridor_distance = median(
-                safety_depths[:DISTANCE_CLOSEST_POINT_COUNT]
-            )
-            self.last_safety_valid_time = now
-        else:
-            self.safety_corridor_distance = None
 
         # ----------------------------------------------------
         # 감지 점이 있는 경우
@@ -1777,41 +2386,6 @@ class FrontDistanceSensor:
             return 0.0
 
         return self.distance
-
-    def get_safety_distance(self):
-        """Return only fresh Radar distance for Safety ECU."""
-        now = time.monotonic()
-
-        # A recent collision must remain visible as zero distance.
-        if now < self.collision_zero_until:
-            return 0.0
-
-        # No fresh Radar measurement.
-        if (
-            self.last_valid_time <= 0.0
-            or now - self.last_valid_time > 0.2
-        ):
-            return None
-
-        return self.get_distance()
-
-    def get_safety_corridor_distance(self):
-        """Return a fresh Radar target in the forward safety corridor."""
-        now = time.monotonic()
-
-        if now < self.collision_zero_until:
-            return 0.0
-
-        if self.safety_corridor_distance is None:
-            return None
-
-        if (
-            self.last_safety_valid_time <= 0.0
-            or now - self.last_safety_valid_time > SAFETY_RADAR_FRESHNESS_S
-        ):
-            return None
-
-        return self.safety_corridor_distance
 
     def destroy(self):
         if self.radar_sensor is not None:
@@ -2850,7 +3424,7 @@ class LaneFFBSender:
 
 
 class SafetyControlReceiver:
-    """Apply Safety commands in D/R and maintain fail-safe in every gear."""
+    """Apply final Safety commands in D and R; keep P stopped."""
     def __init__(self, host="0.0.0.0", port=5008, timeout=0.5):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -2865,101 +3439,52 @@ class SafetyControlReceiver:
         self.mode = 0
         self.limit_percent = 100
         self.risk_level = 0
+        self.risk_cause = None
+        self.risk_reason = None
+        self.risk_target_id = None
         self.failsafe = False
-
-        # Safety UDP packet validation
-        self.allowed_sender_ip = "192.168.0.37"
-        self.last_sequence = None
-        self.session_id = None
-        self.retired_sessions = set()
+        self.gear = None
 
     def receive(self, now):
         # Bound work per frame even if a sender floods this port.
         for _ in range(256):
             try:
-                data, sender_addr = self.socket.recvfrom(4096)
+                data, _ = self.socket.recvfrom(4096)
             except BlockingIOError:
                 break
             except OSError as error:
                 print(f"[CARLA SAFETY] RECEIVE ERROR: {error}")
                 break
-
-            # 1. Sender IP validation
-            if sender_addr[0] != self.allowed_sender_ip:
-                continue
-
             try:
                 packet = json.loads(data)
-
-                if (
-                    not isinstance(packet, dict)
-                    or packet.get("type") != "safety_control"
-                ):
+                if not isinstance(packet, dict) or packet.get("type") != "safety_control":
                     continue
-
                 mode = packet["mode"]
                 limit = packet["limit_percent"]
                 risk = packet["risk_level"]
-                sequence = packet["sequence"]
-                failsafe = packet["failsafe"]
-                session_id = packet["session_id"]
-
-                # 2. Validate packet fields
-                if (
-                    type(mode) is not int
-                    or mode not in (0, 1, 2)
-                    or type(limit) not in (int, float)
-                    or not 0 <= limit <= 100
-                    or type(risk) is not int
-                    or risk not in (0, 1, 2, 3)
-                    or type(sequence) is not int
-                    or sequence < 0
-                    or type(failsafe) is not bool
-                    or not isinstance(session_id, str)
-                    or len(session_id) != 32
-                    or any(c not in "0123456789abcdef" for c in session_id)
-                ):
+                gear = packet["gear"]
+                risk_cause = packet.get("risk_cause")
+                risk_reason = packet.get("risk_reason")
+                risk_target_id = packet.get("target_id")
+                if (type(mode) is not int or mode not in (0, 1, 2)
+                        or type(limit) not in (int, float) or not 0 <= limit <= 100
+                        or type(risk) is not int or risk not in (0, 1, 2, 3)
+                        or type(packet["sequence"]) is not int
+                        or type(packet["failsafe"]) is not bool):
                     continue
-
-                # 3. Reject previously retired sessions
-                if session_id in self.retired_sessions:
+                if gear not in ("D", "R", "P"):
                     continue
-
-                # 4. Handle sender process restart
-                if self.session_id != session_id:
-                    if self.session_id is not None:
-                        # Do not switch while old session is fresh
-                        old_fresh = (
-                            self.last_rx is not None
-                            and 0 <= now - self.last_rx < self.timeout
-                        )
-                        if old_fresh:
-                            continue
-
-                        # New session must begin in a safe state
-                        if not (mode == 2 or failsafe):
-                            continue
-
-                        self.retired_sessions.add(self.session_id)
-
-                    self.session_id = session_id
-                    self.last_sequence = None
-
-                # 5. Reject duplicate or out-of-order sequences
-                if (
-                    self.last_sequence is not None
-                    and sequence <= self.last_sequence
-                ):
+                if (risk_cause is not None and not isinstance(risk_cause, str)
+                    or risk_reason is not None and not isinstance(risk_reason, str)
+                    or risk_target_id is not None and type(risk_target_id) is not int):
                     continue
-
-                # 6. Only accepted packets update control state
-                self.last_sequence = sequence
-                self.mode = mode
-                self.limit_percent = limit
-                self.risk_level = risk
-                self.failsafe = failsafe
+                self.mode, self.limit_percent, self.risk_level = mode, limit, risk
+                self.risk_cause = risk_cause
+                self.risk_reason = risk_reason
+                self.risk_target_id = risk_target_id
+                self.failsafe = packet["failsafe"]
+                self.gear = gear
                 self.last_rx = now
-
             except (ValueError, KeyError, TypeError, UnicodeError):
                 continue
 
@@ -2969,45 +3494,42 @@ class SafetyControlReceiver:
         raw_throttle = control.throttle
         raw_brake = control.brake
         fresh = self.last_rx is not None and 0 <= now - self.last_rx < self.timeout
-
-        # Priority: stale/failsafe > STOP > PARK > LIMIT > NORMAL.
-        if not fresh or self.failsafe:
-            control.throttle = 0.0
-            control.brake = 1.0
-            applied_mode = "FAILSAFE_STOP"
-        elif gear == "P":
-            control.throttle = 0.0
-            control.brake = 1.0
-            control.hand_brake = True
-            applied_mode = "PARK"
-        elif self.mode == 2:
+        # Final priority: stale > failsafe > STOP > LIMIT > NORMAL.
+        if not fresh or self.gear != gear or self.failsafe or self.mode == 2:
             control.throttle = 0.0
             control.brake = 1.0
             applied_mode = "STOP"
+        elif gear == "P":
+            applied_mode = "BYPASS"
         elif self.mode == 1:
-            control.throttle = min(
-                raw_throttle,
-                self.limit_percent / 100.0,
-            )
+            control.throttle = min(raw_throttle, self.limit_percent / 100.0)
+            speed_headroom = LEVEL2_SPEED_LIMIT_KMH - speed_kmh
+            control.throttle *= min(1.0, max(0.0, speed_headroom / LEVEL2_SPEED_APPROACH_KMH))
+            if speed_headroom <= 0.0:
+                control.brake = max(
+                    raw_brake,
+                    min(1.0, LEVEL2_SPEED_MIN_BRAKE
+                        - speed_headroom * LEVEL2_SPEED_BRAKE_PER_KMH),
+                )
             applied_mode = "LIMIT"
         else:
             applied_mode = "NORMAL"
-
         if self.last_log is None or now - self.last_log >= 0.5:
             self.last_log = now
             print(
                 f"[CARLA SAFETY] GEAR={gear} SPEED_KMH={speed_kmh:.1f} "
                 f"CREEP={int(creep_throttle > 0.0)} "
                 f"CREEP_THROTTLE={creep_throttle:.3f} "
-                f"SAFETY_ACTIVE_FOR_REVERSE={int(gear == 'R')} "
+                f"SAFETY_BYPASS_FOR_REVERSE=0 "
                 f"RISK=L{self.risk_level} MODE={applied_mode} "
                 f"LIMIT={self.limit_percent:g} FAILSAFE={int(self.failsafe)} "
-                f"FRESH={int(fresh)} "
+                f"SPEED_CAP_KMH={LEVEL2_SPEED_LIMIT_KMH if applied_mode == 'LIMIT' else GLOBAL_SPEED_LIMIT_KMH if applied_mode == 'NORMAL' else 'OFF'} "
+                f"FRESH={int(fresh)} CMD_GEAR={self.gear} "
                 f"RAW_THROTTLE={raw_throttle if driver_throttle is None else driver_throttle:.2f} "
                 f"RAW_BRAKE={raw_brake:.2f} APPLIED_THROTTLE={control.throttle:.3f} "
                 f"APPLIED_BRAKE={control.brake:.2f}"
             )
-            if not fresh:
+            if not fresh and gear in ("D", "R"):
                 if self.last_rx is None:
                     print("[CARLA SAFETY] WAITING FOR FIRST safety_control PACKET -> STOP")
                 print("[CARLA SAFETY] STALE -> STOP")
@@ -3020,6 +3542,10 @@ def main():
     global control_mode
 
     safety_control_receiver = None
+    performance = SafetyPerfMonitor()
+    print(f"[PACE SAFETY DETECTOR] revision={SAFETY_PERF_REVISION}", flush=True)
+    if performance.enabled:
+        print(f"[PACE PERF] revision={SAFETY_PERF_REVISION}", flush=True)
 
     pygame.init()
     pygame.font.init()
@@ -3139,8 +3665,17 @@ def main():
     last_status_time = 0.0
     last_telemetry_send_time = 0.0
     last_ui_send_time = 0.0
-    last_radar_debug_time = 0.0
     telemetry_sequence = 0
+    last_safety_obstacle_id = None
+    previous_selected_target_id = None
+    safety_box_cache = {}
+    target_debug = None
+    if os.environ.get("PACE_SAFETY_TARGET_DEBUG") == "1":
+        target_debug = safety_target_debug
+    target_debug_font = None
+    if target_debug is not None:
+        target_debug_font = pygame.font.Font(None, 28)
+    last_safety_packet = None
 
     try:
         print()
@@ -3166,6 +3701,10 @@ def main():
             client.set_timeout(30.0)
             print("Map loaded:", world.get_map().name)
 
+        safety_road_map = world.get_map()
+        if not SAFETY_VEHICLE_ONLY:
+            safety_static_grid(world, safety_road_map)
+
         # ====================================================
         # ASYNCHRONOUS MODE
         #
@@ -3182,10 +3721,13 @@ def main():
             world.apply_settings(settings)
 
         # 서버가 한 프레임 진행하도록 잠깐 기다림
+        stage_started = time.perf_counter() if performance.enabled else None
         try:
             world.wait_for_tick(2.0)
         except RuntimeError:
             pass
+        if performance.enabled:
+            performance.record("startup_wait_for_tick", stage_started)
 
         # ====================================================
         # TRAFFIC MANAGER
@@ -3221,6 +3763,7 @@ def main():
         # ====================================================
 
         vehicle = spawn_mustang(world)
+        safety_steering_geometry_cache = safety_steering_geometry(vehicle)
 
         print("Vehicle:", vehicle.type_id)
         print(
@@ -3265,14 +3808,9 @@ def main():
         # FRONT DISTANCE SENSOR
         # ====================================================
 
-        front_distance_sensor = FrontDistanceSensor(
-            vehicle
-        )
-
-        print(
-            f"Front distance sensor: 0 ~ "
-            f"{FRONT_DISTANCE_RANGE:.1f} m"
-        )
+        if not SAFETY_VEHICLE_ONLY:
+            front_distance_sensor = FrontDistanceSensor(vehicle)
+            print(f"Front distance sensor: 0 ~ {FRONT_DISTANCE_RANGE:.1f} m")
 
         # ====================================================
         # UDP
@@ -3295,6 +3833,7 @@ def main():
             socket.AF_INET,
             socket.SOCK_DGRAM,
         )
+        telemetry_sock.setblocking(False)
 
         print(
             f"Telemetry target: "
@@ -3382,8 +3921,13 @@ def main():
         running = True
 
         while running:
+            cycle_started = time.perf_counter() if performance.enabled else None
             # manual_control.py처럼 클라이언트 렌더만 60 FPS 제한
+            stage_started = time.perf_counter() if performance.enabled else None
             milliseconds = clock.tick_busy_loop(CLIENT_FPS)
+            if performance.enabled:
+                performance.record("client_pacing", stage_started)
+            work_started = time.perf_counter() if performance.enabled else None
 
             # =================================================
             # EVENTS
@@ -4425,12 +4969,18 @@ def main():
 
             control.manual_gear_shift = False
 
+            if applied_gear in ("D", "R"):
+                apply_vehicle_speed_limit(control, current_speed_kmh)
+
+            stage_started = time.perf_counter() if performance.enabled else None
             safety_control_receiver.apply(
                 control, time.monotonic(), gear=applied_gear,
                 speed_kmh=current_speed_kmh, creep_throttle=creep_throttle,
                 driver_throttle=driver_throttle,
             )
             vehicle.apply_control(control)
+            if performance.enabled:
+                performance.record("apply_control", stage_started)
 
             # Read this frame's final LFA value only after vehicle control is applied.
             lane_ffb_sender.send(
@@ -4442,9 +4992,38 @@ def main():
             # RENDER
             # =================================================
 
+            stage_started = time.perf_counter() if performance.enabled else None
             display.fill((0, 0, 0))
             camera.render(display)
+            if target_debug_font is not None and last_safety_packet is not None:
+                pi_status = "STALE"
+                if (safety_control_receiver.last_rx is not None
+                    and time.monotonic() - safety_control_receiver.last_rx
+                    < safety_control_receiver.timeout):
+                    pi_status = f"L{safety_control_receiver.risk_level}"
+                debug_lines = (
+                    f"SAFETY target={last_safety_packet['obstacle_id']} "
+                    f"distance={last_safety_packet['distance_m']}m "
+                    f"TTC={last_safety_packet['ttc_s']}s",
+                    f"PiRisk={pi_status} PiTarget={safety_control_receiver.risk_target_id} "
+                    f"Cause={safety_control_receiver.risk_cause} "
+                    f"Rule={safety_control_receiver.risk_reason}",
+                )
+                debug_labels = [target_debug_font.render(line, True, (255, 255, 255))
+                                for line in debug_lines]
+                debug_background = pygame.Surface(
+                    (max(label.get_width() for label in debug_labels) + 24,
+                     sum(label.get_height() for label in debug_labels) + 20),
+                    pygame.SRCALPHA)
+                debug_background.fill((0, 0, 0, 190))
+                display.blit(debug_background, (12, 12))
+                label_y = 18
+                for label in debug_labels:
+                    display.blit(label, (24, label_y))
+                    label_y += label.get_height() + 4
             pygame.display.flip()
+            if performance.enabled:
+                performance.record("camera_render_flip", stage_started)
 
             # =================================================
             # PC -> RASPBERRY PI SAFETY ECU - JSON / 10 Hz
@@ -4454,6 +5033,7 @@ def main():
             #   source,
             #   sequence,
             #   vehicle_speed_kmh,
+            #   gear,
             #   obstacle_id,
             #   distance_m,
             #   closing_speed_mps,
@@ -4476,6 +5056,7 @@ def main():
                 now - last_telemetry_send_time
                 >= TELEMETRY_SEND_INTERVAL
             ):
+                stage_started = time.perf_counter() if performance.enabled else None
                 telemetry_payload = build_safety_telemetry(
                     world,
                     vehicle,
@@ -4484,34 +5065,36 @@ def main():
                     virtual_obstacle_distance,
                     virtual_obstacle_materialized=(night_obstacle is not None),
                     gear=applied_gear,
-                    front_distance_sensor=front_distance_sensor,
+                    steer=control.steer,
+                    escape_target_id=last_safety_obstacle_id,
+                    profile=performance if performance.enabled else None,
+                    box_cache=safety_box_cache,
+                    road_map=safety_road_map,
+                    debug=target_debug,
+                    steering_geometry=safety_steering_geometry_cache,
                 )
-
-                # Radar / Safety telemetry diagnostic (1 Hz)
-                if now - last_radar_debug_time >= 1.0:
-                    radar_display_distance = (
-                        front_distance_sensor.get_safety_distance()
-                        if front_distance_sensor is not None
-                        else None
-                    )
-
-                    radar_safety_distance = (
-                        front_distance_sensor.get_safety_corridor_distance()
-                        if front_distance_sensor is not None
-                        else None
-                    )
-
-                    print(
-                        "\n[OBSTACLE DEBUG] "
-                        f"GEAR={applied_gear} "
-                        f"RADAR_DISPLAY={radar_display_distance} "
-                        f"RADAR_SAFETY={radar_safety_distance} "
-                        f"TX_DISTANCE={telemetry_payload['distance_m']} "
-                        f"TX_TTC={telemetry_payload['ttc_s']} "
-                        f"TX_OBSTACLE_ID={telemetry_payload['obstacle_id']}"
-                    )
-
-                    last_radar_debug_time = now
+                last_safety_packet = telemetry_payload
+                if target_debug is not None:
+                    if telemetry_payload["obstacle_id"] != previous_selected_target_id:
+                        print(
+                            f"[SAFETY SELECTION] seq={telemetry_payload['sequence']} "
+                            f"previous={previous_selected_target_id} "
+                            f"target={telemetry_payload['obstacle_id']} "
+                            f"distance_m={telemetry_payload['distance_m']} "
+                            f"ttc_s={telemetry_payload['ttc_s']} source=CARLA_5006",
+                            flush=True,
+                        )
+                        previous_selected_target_id = telemetry_payload["obstacle_id"]
+                    try:
+                        draw_safety_route_debug(
+                            world, vehicle, safety_road_map, applied_gear,
+                            control.steer, telemetry_payload["obstacle_id"])
+                    except RuntimeError:
+                        pass
+                if performance.enabled:
+                    performance.record("safety_telemetry", stage_started)
+                if telemetry_payload["obstacle_id"] is not None:
+                    last_safety_obstacle_id = telemetry_payload["obstacle_id"]
 
                 telemetry_message = json.dumps(
                     telemetry_payload,
@@ -4519,6 +5102,7 @@ def main():
                     ensure_ascii=False,
                 )
 
+                stage_started = time.perf_counter() if performance.enabled else None
                 try:
                     telemetry_sock.sendto(
                         telemetry_message.encode("utf-8"),
@@ -4530,6 +5114,8 @@ def main():
                 except OSError:
                     # 네트워크가 잠깐 끊겨도 CARLA 주행은 계속
                     pass
+                if performance.enabled:
+                    performance.record("safety_udp", stage_started)
 
                 telemetry_sequence = (
                     telemetry_sequence + 1
@@ -4540,6 +5126,7 @@ def main():
             # Independent UI update after the final LFA correction is applied.
             ui_now = time.monotonic()
             if ui_now - last_ui_send_time >= UI_SEND_INTERVAL:
+                stage_started = time.perf_counter() if performance.enabled else None
                 ui_payload = {
                     "type": "carla_ui_state",
                     "night_mode": bool(night_scenario_started),
@@ -4559,6 +5146,8 @@ def main():
                 except OSError:
                     # A failed/dropped UI update must not stop driving.
                     pass
+                if performance.enabled:
+                    performance.record("hmi_udp", stage_started)
                 last_ui_send_time = ui_now
 
             # =================================================
@@ -4568,6 +5157,7 @@ def main():
             now = time.monotonic()
 
             if now - last_status_time >= 0.25:
+                stage_started = time.perf_counter() if performance.enabled else None
                 speed_kmh = get_speed_kmh(vehicle)
                 gear_text = applied_gear
 
@@ -4584,7 +5174,12 @@ def main():
 
                 front_distance = None
 
-                if (
+                if SAFETY_VEHICLE_ONLY:
+                    front_distance = (
+                        last_safety_packet["distance_m"]
+                        if last_safety_packet is not None else None
+                    )
+                elif (
                     virtual_obstacle_active
                     and virtual_obstacle_distance is not None
                 ):
@@ -4630,6 +5225,13 @@ def main():
                 )
 
                 last_status_time = now
+                if performance.enabled:
+                    performance.record("status_output", stage_started)
+
+            if performance.enabled:
+                performance.record("client_work", work_started)
+                performance.record("client_cycle", cycle_started)
+                performance.report(world, vehicle)
 
     except KeyboardInterrupt:
         print()

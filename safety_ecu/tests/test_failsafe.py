@@ -32,9 +32,11 @@ def test_tof_not_required():
     state.carla_connected = True
     assert_equal(failsafe.evaluate(state, "CARLA"), False, "CARLA must work without ToF")
     state.carla_connected = False
+    state.carla_link_state = "LOST"
     assert_equal(failsafe.evaluate(state, "CARLA"), True, "CARLA timeout must remain protected")
     assert_equal(failsafe.reason, "CARLA_COMMUNICATION_ERROR", "CARLA fault changed")
     state.pedal_connected = False
+    state.pedal_ever_connected = True
     failsafe.evaluate(state)
     assert_equal(failsafe.reason, "PEDAL_COMMUNICATION_ERROR", "Pedal fault changed")
     print("[PASS] ToF retired; CARLA and pedal protection preserved")
@@ -96,6 +98,7 @@ def test_pedal_disconnected_failsafe():
 
     state.tof_connected = True
     state.pedal_connected = False
+    state.pedal_ever_connected = True
 
     active = failsafe.evaluate(state)
 

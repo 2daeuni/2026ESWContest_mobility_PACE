@@ -43,6 +43,7 @@ Item {
     // ---------- 가운데 문구 ----------
     Column {
         id: head
+        width: parent.width * 0.9
         anchors.horizontalCenter: parent.horizontalCenter
         y: parent.height * 0.07
         spacing: 2
@@ -59,11 +60,15 @@ Item {
             }
         }
         Text {
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: "BRAKE NOW"
-            font.pixelSize: 168
+            width: head.width
+            height: ov.height * 0.14
+            text: ov.s.banner && ov.s.banner.title ? ov.s.banner.title : "충돌 위험! 즉시 제동하세요"
+            font.pixelSize: Math.min(100, ov.height * 0.12)
+            fontSizeMode: Text.Fit
+            minimumPixelSize: 48
             font.weight: Font.Black
-            font.letterSpacing: 4
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
             color: "white"
         }
         Text {
@@ -179,7 +184,7 @@ Item {
         Repeater {
             model: [
                 ["속도", Theme.has(ov.s.speed_kmh) ? Math.round(ov.s.speed_kmh) + " km/h" : "--"],
-                [ov.s.gear === "R" ? "후방 거리" : "장애물 거리", Theme.has(ov.s.distance_m) ? Theme.fmt(ov.s.distance_m, 1) + " m" : "--"],
+                ["전방 거리", Theme.has(ov.s.distance_m) ? Theme.fmt(ov.s.distance_m, 1) + " m" : "--"],
                 ["충돌 예상", Theme.has(ov.s.ttc_s) ? Theme.fmt(ov.s.ttc_s, 1) + " 초" : "--"]
             ]
             Rectangle {

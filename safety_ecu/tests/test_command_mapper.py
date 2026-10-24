@@ -36,14 +36,14 @@ def test_risk_unavailable():
 
     assert_equal(
         commands["motor"]["control_mode"],
-        0,
-        "Motor must be Normal when risk unavailable",
+        2,
+        "Motor must STOP when risk unavailable",
     )
 
     assert_equal(
         commands["motor"]["output_limit"],
-        100,
-        "Motor output limit must be 100 when risk unavailable",
+        0,
+        "Motor output limit must be zero when risk unavailable",
     )
 
     assert_equal(
@@ -110,6 +110,8 @@ def test_level_1():
         risk_level=1,
         risk_available=True,
         failsafe_active=False,
+        accelerator=70,
+        pedal_misuse_active=True,
     )
 
     assert_equal(
@@ -151,6 +153,8 @@ def test_level_2():
         risk_level=2,
         risk_available=True,
         failsafe_active=False,
+        accelerator=70,
+        pedal_misuse_active=True,
     )
 
     assert_equal(
@@ -193,6 +197,8 @@ def test_level_3():
         risk_level=3,
         risk_available=True,
         failsafe_active=False,
+        accelerator=70,
+        pedal_misuse_active=True,
     )
 
     assert_equal(
@@ -227,7 +233,7 @@ def test_level_3():
 
     assert_equal(
         commands["motor"]["command_flags"],
-        0x01,
+        0x03,
         "Level 3 motor flags",
     )
 

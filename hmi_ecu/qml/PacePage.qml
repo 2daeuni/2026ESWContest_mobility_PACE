@@ -24,10 +24,7 @@ Item {
         border.color: Theme.border
 
         // CARLA 카메라 영상이 들어오면 실제 렌더링 화면, 없거나 DEMO 주행이면 그래픽 도로 화면
-        // (가상 DEMO 주행만 그래픽 화면, DEMO · CARLA / LIVE 는 CARLA 실제 영상. R 기어면 후방 영상이 올 때만)
-        readonly property bool useCam: !!(hmi.camera && hmi.camera.fresh)
-                                       && !(page.s.demo_drive && !page.s.demo_carla)
-                                       && (page.s.gear !== "R" || hmi.camera.view === "rear")
+        readonly property bool useCam: !!(hmi.camera && hmi.camera.fresh) && !page.s.demo_drive
         CameraView {
             visible: parent.useCam
             anchors.fill: parent
@@ -35,7 +32,6 @@ Item {
             cam: hmi.camera
             level: page.s.risk_level
             distance: page.s.distance_m
-            rearDistance: page.s.rear_distance_m
             braking: (page.s.brake || 0) > 3
         }
         DriveVis3D {
@@ -43,8 +39,6 @@ Item {
             anchors.fill: parent
             anchors.margins: 6
             camView: "driver"
-            reverse: page.s.gear === "R"              // 후진 기어 → 후방 카메라
-            rearDistance: page.s.rear_distance_m
             labelTop: 84
             world: page.world
             msaa: SceneEnvironment.Medium
@@ -270,7 +264,7 @@ Item {
         width: page.col3; height: page.height - 492
         id: safetyCard
         title: "SAFETY"
-        subtitle: "판정 근거 · 3개 중 2개"
+        subtitle: page.s.operating_mode === "CARLA" ? "접근 · 차간거리 · 페달" : "판정 근거 · 3개 중 2개"
         readonly property color lc: Theme.levelColor(page.s.risk_level)
         Column {
             anchors.fill: parent
@@ -278,9 +272,20 @@ Item {
             spacing: 4
             ConditionMatrix {
                 width: parent.width
+                visible: page.s.operating_mode !== "CARLA"
+                height: visible ? 90 : 0
                 conditions: page.s.risk_conditions
                 thresholds: page.s.risk_thresholds
                 level: page.s.risk_level
+            }
+            Column {
+                width: parent.width
+                height: page.s.operating_mode === "CARLA" ? 90 : 0
+                visible: page.s.operating_mode === "CARLA"
+                spacing: 4
+                Text { text: "위험 원인: " + (page.s.risk_cause_ko || "-"); font.pixelSize: 14; color: Theme.text }
+                Text { text: "차간 시간: " + (Theme.has(page.s.time_headway_s) ? page.s.time_headway_s.toFixed(1) + "초" : "-"); font.pixelSize: 14; color: Theme.sub }
+                Text { text: page.s.normal_braking ? "정상 제동 확인" : (page.s.pedal_misuse_active ? "페달 조작 주의" : "페달 오조작 없음"); font.pixelSize: 14; color: page.s.pedal_misuse_active ? Theme.orange : Theme.sub }
             }
             Item {
                 width: parent.width; height: 30
@@ -289,17 +294,20 @@ Item {
                     x: 84
                     anchors.verticalCenter: parent.verticalCenter
                     width: parent.width - 84; height: 28; radius: 8
-                    color: page.s.failsafe_active ? Theme.redSoft : Theme.greenSoft
+                    color: page.s.failsafe_active ? Theme.redSoft
+                           : page.s.system_phase === "WAITING" ? Theme.cardSoft : Theme.greenSoft
                     Text {
                         anchors.left: parent.left
                         anchors.leftMargin: 12
                         anchors.right: parent.right
                         anchors.rightMargin: 8
                         anchors.verticalCenter: parent.verticalCenter
-                        text: page.s.failsafe_active ? (page.s.failsafe_reason_ko || "Active") : "Normal"
+                        text: page.s.failsafe_active ? (page.s.failsafe_reason_ko || "Active")
+                              : page.s.system_phase === "WAITING" ? page.s.waiting_reason_ko : "Normal"
                         elide: Text.ElideRight
                         font.pixelSize: 15
-                        color: page.s.failsafe_active ? Theme.red : Theme.green
+                        color: page.s.failsafe_active ? Theme.red
+                               : page.s.system_phase === "WAITING" ? Theme.orange : Theme.green
                     }
                 }
             }

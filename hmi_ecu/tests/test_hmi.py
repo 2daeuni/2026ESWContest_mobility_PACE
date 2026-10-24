@@ -87,7 +87,7 @@ class MergeTest(unittest.TestCase):
         s = state_merge.merge({}, udp, now=100.1)
         self.assertIsNone(s["risk_level"])
         self.assertEqual(s["banner"]["severity"], "info")
-        self.assertIn("차속", s["banner"]["title"])
+        self.assertEqual(s["system_phase"], "WAITING")
         self.assertAlmostEqual(s["distance_m"], 1.2)
 
     def test_failsafe_from_udp(self):
@@ -95,6 +95,72 @@ class MergeTest(unittest.TestCase):
         s = state_merge.merge({}, udp, now=1.05)
         self.assertEqual(s["banner"]["severity"], "fault")
         self.assertIn("페달 센서", s["banner"]["title"])
+
+    def test_collision_braking_banner_is_not_pedal_misuse(self):
+        udp = {"data": {"risk_level": 3, "risk_available": True,
+                        "risk_cause": "COLLISION", "normal_braking": True,
+                        "accelerator": 0, "brake": 50, "pedal_connected": True}, "t": 1.0}
+        merged = state_merge.merge({}, udp, now=1.0)
+        self.assertEqual(merged["risk_cause_ko"], "충돌 접근")
+        self.assertIn("충돌 위험", merged["banner"]["title"])
+        self.assertNotIn("오조작", merged["banner"]["title"])
+
+    def test_level_two_warning_switches_without_changing_risk(self):
+        from hmi.audio import choose_pattern
+
+        udp = {"data": {"risk_level": 2, "risk_available": True,
+                        "risk_cause": "COLLISION_AND_PEDAL", "pedal_connected": True,
+                        "accelerator": 70, "brake": 0,
+                        "haptic_vibration_command": 1,
+                        "time_headway_s": 0.8}, "t": 1.0}
+        active = state_merge.merge({}, udp, now=1.0)
+        self.assertEqual(active["banner"]["title"], "가속페달에서 발을 떼세요")
+        self.assertEqual(choose_pattern(active), "warning")
+        self.assertEqual(active["time_headway_s"], 0.8)
+
+        udp["data"].update(accelerator=0, haptic_vibration_command=0,
+                           risk_cause="COLLISION", pedal_misuse_active=False)
+        released = state_merge.merge({}, udp, now=1.0)
+        self.assertEqual(released["risk_level"], 2)
+        self.assertEqual(released["banner"]["title"], "브레이크를 밟으세요")
+        self.assertEqual(choose_pattern(released), "warning")
+        self.assertFalse(released["pedal_warning_active"])
+
+    def test_normal_braking_clears_warning_but_not_unresolved_collision(self):
+        from hmi.audio import choose_pattern
+
+        udp = {"data": {"risk_level": 2, "risk_available": True,
+                        "risk_cause": "RECOVERING", "normal_braking": True,
+                        "pedal_connected": True, "accelerator": 0, "brake": 40,
+                        "haptic_vibration_command": 0}, "t": 1.0}
+        recovered = state_merge.merge({}, udp, now=1.0)
+        self.assertEqual(recovered["banner"]["severity"], "ok")
+        self.assertIsNone(choose_pattern(recovered))
+        self.assertFalse(recovered["haptic_cmd_on"])
+
+        udp["data"].update(risk_level=3, risk_cause="COLLISION")
+        danger = state_merge.merge({}, udp, now=1.0)
+        self.assertEqual(danger["banner"]["severity"], "danger")
+        self.assertEqual(choose_pattern(danger), "danger")
+
+    def test_unpressed_pedal_level_three_keeps_collision_warning(self):
+        from hmi.audio import choose_pattern
+
+        udp = {"data": {"risk_level": 3, "risk_available": True,
+                        "risk_cause": "COLLISION", "pedal_connected": True,
+                        "accelerator": 0, "brake": 0,
+                        "haptic_vibration_command": 0}, "t": 1.0}
+        merged = state_merge.merge({}, udp, now=1.0)
+        self.assertEqual(merged["banner"]["title"], "충돌 위험! 즉시 제동하세요")
+        self.assertEqual(choose_pattern(merged), "danger")
+        self.assertFalse(merged["haptic_cmd_on"])
+
+    def test_risk_cause_change_is_logged_without_level_change(self):
+        previous = {"risk_level": 2, "risk_available": True,
+                    "risk_cause": "PEDAL_MISUSE", "risk_name": "WARNING"}
+        current = {**previous, "risk_cause": "HEADWAY", "risk_cause_ko": "차간거리 부족"}
+        changes = events.diff(previous, current)
+        self.assertTrue(any("차간거리 부족" in entry["text"] for entry in changes))
 
     def test_score_normalized(self):
         udp = {"data": {"risk_level": 2, "risk_available": True, "total_risk": 64,
@@ -123,44 +189,32 @@ class EventTest(unittest.TestCase):
 
 
 class PublisherCompatTest(unittest.TestCase):
-    """Verify that HMI understands packets from the current Safety sender."""
-
-    @staticmethod
-    def sample():
-        state = types.SimpleNamespace(
-            accelerator=70, brake=0, accelerator_rate=120.5, brake_rate=0.0,
-            pedal_connected=True, pedal_sensor_status=0,
-            tof_connected=True, carla_connected=False,
-            distance_valid=True, distance_cm=850.0,
-            vehicle_speed=None, ttc=None,
-            bns=0.0, pms=0.0, total_risk=0.0, risk_level=0,
-            haptic_connected=True, haptic_available=True, haptic_fault_code=0,
-        )
-        commands = {"haptic": {"vibration_command": 0, "intensity": 0, "frequency": 0},
-                    "motor": {"control_mode": 0, "output_limit": 100, "command_flags": 1}}
-        values = dict(input_mode="HARDWARE", bns_available=False, pms_available=True,
-                      risk_available=False, failsafe_active=False, failsafe_reason=None,
-                      commands=commands, motor_connected=True)
-        return state, values
+    """safety_ecu/hmi_publisher.py 가 보낸 패킷을 HMI 가 그대로 이해하는지."""
 
     def test_roundtrip(self):
-        from hmi_sender import HmiSender
+        from hmi_publisher import HMIPublisher
 
         rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         rx.bind(("127.0.0.1", 0))
         rx.settimeout(1.0)
         port = rx.getsockname()[1]
 
-        state, values = self.sample()
-        sender = HmiSender()
-        sender.target = ("127.0.0.1", port)
-        sender.start()
-        try:
-            sender.publish(state, **values)
-            packet = json.loads(rx.recvfrom(65535)[0])
-        finally:
-            sender.close()
-            rx.close()
+        state = types.SimpleNamespace(
+            accelerator=70, brake=0, accelerator_rate=120.5, brake_rate=0.0,
+            pedal_connected=True, pedal_sensor_status=0,
+            tof_connected=True, distance_valid=True, distance_cm=850.0,
+            vehicle_speed=None, ttc=None,
+            bns=0.0, pms=0.0, total_risk=0.0, risk_level=0,
+            haptic_connected=True, haptic_available=True, haptic_fault_code=0,
+        )
+        commands = {"haptic": {"vibration_command": 0, "intensity": 0, "frequency": 0},
+                    "motor": {"control_mode": 0, "output_limit": 100, "command_flags": 1}}
+
+        pub = HMIPublisher(port=port)
+        self.assertTrue(pub.publish(state, False, True, False, False, None, commands, force=True))
+        packet = json.loads(rx.recvfrom(65535)[0])
+        pub.close()
+        rx.close()
 
         s = state_merge.merge({}, {"data": packet, "t": 5.0}, now=5.0)
         self.assertEqual(s["accelerator"], 70)
@@ -170,17 +224,12 @@ class PublisherCompatTest(unittest.TestCase):
         self.assertTrue(s["link_safety"])
 
     def test_publish_never_raises_when_no_listener(self):
-        from hmi_sender import HmiSender
-
-        state, values = self.sample()
-        sender = HmiSender()
-        sender.target = ("127.0.0.1", 9)
-        sender.start()
-        try:
-            for _ in range(3):
-                sender.publish(state, **values)
-        finally:
-            sender.close()
+        from hmi_publisher import HMIPublisher
+        pub = HMIPublisher(port=9)   # 아무도 안 듣는 포트
+        state = types.SimpleNamespace()
+        for _ in range(3):
+            pub.publish(state, False, False, False, False, None, {}, force=True)
+        pub.close()
 
 
 if __name__ == "__main__":
@@ -364,4 +413,30 @@ class MotorStatusTest(unittest.TestCase):
     def test_no_motor_status_stop_command(self):
         cmd = bytes([2, 0, 0, 0x03, 0, 0, 0, 1])
         s = state_merge.merge(can_store(1.0, MOTOR_COMMAND=(0x120, cmd)), None, now=1.0)
-        self.assertEqual(s["failsafe_reason"], "MOTOR_NO_RESPONSE")
+        self.assertFalse(s["failsafe_active"])
+        self.assertEqual(s["system_phase"], "WAITING")
+
+    def test_safety_waiting_overrides_startup_motor_fault(self):
+        motor = bytes([0, 0, 0xFF, 0xFF, 3, 0x04, 0, 1])
+        store = can_store(1.0, MOTOR_STATUS=(0x210, motor))
+        udp = {"data": {"system_phase": "WAITING", "waiting_reason": "CARLA_WAITING",
+                        "failsafe_active": False, "risk_available": False}, "t": 1.0}
+        merged = state_merge.merge(store, udp, now=1.0)
+        self.assertFalse(merged["failsafe_active"])
+        self.assertEqual(merged["waiting_reason"], "CARLA_WAITING")
+        self.assertEqual(merged["banner"]["severity"], "info")
+
+    def test_ready_unexpected_estop_is_reported(self):
+        motor = bytes([0, 0, 0xFF, 0xFF, 0, 0x08, 0, 1])
+        store = can_store(1.0, MOTOR_STATUS=(0x210, motor))
+        udp = {"data": {"system_phase": "READY", "failsafe_active": False,
+                        "risk_available": True, "motor_estop_commanded": False,
+                        "motor_recovery_pending": False}, "t": 1.0}
+        merged = state_merge.merge(store, udp, now=1.0)
+        self.assertEqual(merged["failsafe_reason"], "MOTOR_ESTOP")
+
+    def test_actual_motor_fault_is_not_labeled_estop(self):
+        motor = bytes([0, 0, 0xFF, 0xFF, 3, 0x04, 0, 1])
+        store = can_store(1.0, MOTOR_STATUS=(0x210, motor))
+        merged = state_merge.merge(store, None, now=1.0)
+        self.assertEqual(merged["failsafe_reason"], "MOTOR_FAULT")

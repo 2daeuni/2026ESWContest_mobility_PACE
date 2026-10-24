@@ -14,6 +14,7 @@ import argparse
 import os
 import signal
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -119,6 +120,26 @@ def main():
     if not engine.rootObjects():
         print("[HMI] QML 로드 실패")
         return 1
+
+    if os.environ.get("PACE_HMI_FPS_LOG") == "1":
+        window = engine.rootObjects()[0]
+        frame_count = [0]
+        frame_started = [time.monotonic()]
+
+        def frame_swapped():
+            frame_count[0] += 1
+
+        def report_hmi_fps():
+            now = time.monotonic()
+            elapsed = now - frame_started[0]
+            print(f"[PACE HMI PERF] render_fps={frame_count[0] / elapsed:.1f}", flush=True)
+            frame_count[0] = 0
+            frame_started[0] = now
+
+        window.frameSwapped.connect(frame_swapped)
+        fps_timer = QTimer()
+        fps_timer.timeout.connect(report_hmi_fps)
+        fps_timer.start(5000)
 
     # Ctrl+C 로 종료 가능하게
     signal.signal(signal.SIGINT, lambda *_: app.quit())

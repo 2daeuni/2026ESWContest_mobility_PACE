@@ -67,7 +67,7 @@ class CANSender:
             alive_counter & 0xFF,
         ])
 
-        self.send(
+        return self.send(
             arbitration_id=0x110,
             data=data,
         )

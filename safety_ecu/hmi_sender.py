@@ -9,7 +9,12 @@ import time
 
 def build_packet(state, *, seq, input_mode, bns_available, pms_available,
                  risk_available, failsafe_active, failsafe_reason,
-                 commands, motor_connected):
+                 commands, motor_connected, system_phase=None,
+                 waiting_reason=None, motor_status_seen=False,
+                 motor_recovery_pending=False, risk_cause=None,
+                 normal_braking=False, pedal_misuse_active=False,
+                 pedal_conflict=False, time_headway_s=None,
+                 safe_distance_m=None, required_deceleration_mps2=None):
     """Snapshot actual state and final commands without modifying either."""
     fields = (
         "pedal_connected", "accelerator", "brake", "accelerator_rate",
@@ -22,6 +27,18 @@ def build_packet(state, *, seq, input_mode, bns_available, pms_available,
         seq=seq, operating_mode=input_mode,
         score_max=1.0,  # Existing HMI metadata: BNS/PMS/total are normalized, not 0..100.
         motor_connected=motor_connected,
+        motor_status_seen=motor_status_seen,
+        motor_recovery_pending=motor_recovery_pending,
+        system_phase=system_phase,
+        waiting_reason=waiting_reason,
+        risk_cause=risk_cause,
+        normal_braking=normal_braking,
+        pedal_misuse_active=pedal_misuse_active,
+        pedal_warning_active=bool(commands["haptic"]["vibration_command"]),
+        pedal_conflict=pedal_conflict,
+        time_headway_s=time_headway_s,
+        safe_distance_m=safe_distance_m,
+        required_deceleration_mps2=required_deceleration_mps2,
         bns_available=bns_available, pms_available=pms_available,
         risk_available=risk_available, failsafe_active=failsafe_active,
         failsafe_reason=failsafe_reason,
@@ -30,6 +47,7 @@ def build_packet(state, *, seq, input_mode, bns_available, pms_available,
         haptic_frequency=commands["haptic"]["frequency"],
         motor_control_mode=commands["motor"]["control_mode"],
         motor_output_limit=commands["motor"]["output_limit"],
+        motor_estop_commanded=bool(commands["motor"]["command_flags"] & 0x02),
     )
     if input_mode == "CARLA":
         packet.update(
@@ -60,21 +78,35 @@ class HmiSender:
         self._thread = threading.Thread(target=self._run, name="hmi-sender", daemon=True)
         self._next_publish = 0.0
         self._seq = 0
+        self._last_status = None
 
     def start(self):
         self._thread.start()
 
     def publish(self, state, **values):
         now = time.monotonic()
-        if now < self._next_publish:
+        status = (state.risk_level, values.get("system_phase"),
+                  values.get("waiting_reason"), values.get("failsafe_reason"),
+                  values.get("risk_cause"),
+                  values.get("commands", {}).get("haptic", {}).get("vibration_command"))
+        status_changed = status != self._last_status
+        if now < self._next_publish and not status_changed:
             return
         self._next_publish = now + 0.1
+        self._last_status = status
         packet = build_packet(state, seq=self._seq, **values)
         self._seq += 1
         try:
             self._queue.put_nowait(packet)
         except queue.Full:
-            pass  # Telemetry may be dropped; control must never wait.
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(packet)
+            except queue.Full:
+                pass
 
     def _run(self):
         sock = None

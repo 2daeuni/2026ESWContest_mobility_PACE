@@ -73,7 +73,6 @@ def main():
     ap.add_argument("--speed", type=float, default=40, help="km/h")
     ap.add_argument("--duration", type=float, default=0)
     ap.add_argument("--approach", action="store_true", help="앞에 멈춘 차로 가속 페달 밟은 채 접근 (경고 테스트)")
-    ap.add_argument("--reverse", action="store_true", help="후진 기어(R), 뒤에 멈춘 차 (후방 화면 테스트)")
     args = ap.parse_args()
 
     mc = build_town()
@@ -95,14 +94,12 @@ def main():
                 sock.sendto(json.dumps(pkt, separators=(",", ":")).encode(), target)
             sent = time.monotonic()
 
-        if args.reverse:
-            ex = 120.0
         lead_x = ex + 22
         if args.approach:
             lead_x = 260.0
             if lead_x - ex < 6.5:
                 ex = lead_x - 6.5
-        traffic = [(lead_x, 5.25, 0), (ex - 6.6, 5.25, 0)] if args.reverse else [(lead_x, 5.25, 0), (ex + 9, 1.75, 0), (ex + 45, 1.75, 0), (ex - 12, 1.75, 0),
+        traffic = [(lead_x, 5.25, 0), (ex + 9, 1.75, 0), (ex + 45, 1.75, 0), (ex - 12, 1.75, 0),
                    (ex + 30 - (t * 20) % 120, -1.75, 180), (ex + 70 - (t * 15) % 140, -5.25, 180)]
         vehicles = []
         for i, (vx, vy, vyaw) in enumerate(traffic):
@@ -117,9 +114,8 @@ def main():
         packet = {
             "v": 1, "type": "carla_scene", "seq": seq, "map": "FAKE_TOWN",
             "ego": {"id": 1, "type_id": "vehicle.tesla.model3", "length": 4.8, "width": 1.9,
-                    "speed_kmh": 3.0 if args.reverse else args.speed, "gear": "R" if args.reverse else "D", "throttle": 0.6 if args.approach else 0.3, "brake": 0.0},
-            "ego_v_fwd": -0.8 if args.reverse else args.speed / 3.6,
-            "rear": {"id": 101, "distance": round(6.6 - 4.75 - 0.6 * math.sin(t), 2)} if args.reverse else {"id": None, "distance": None},
+                    "speed_kmh": args.speed, "gear": "D", "throttle": 0.6 if args.approach else 0.3, "brake": 0.0},
+            "ego_v_fwd": args.speed / 3.6,
             "lane": {"center": center, "width": LW, "lanes_left": 1, "lanes_right": 0, "on_road": True},
             "lead": {"id": lead["id"], "distance": round(lead["x"] - 4.75, 2),
                      "closing": round(args.speed / 3.6, 2) if args.approach else 0.0},

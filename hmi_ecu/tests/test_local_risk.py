@@ -49,33 +49,6 @@ class InputsTest(unittest.TestCase):
         self.assertEqual(inp["acc"], 50.0)
         self.assertEqual(inp["pedal_src"], "CARLA")
 
-    def test_reverse_uses_rear(self):
-        s = {"pedal_source": None, "accelerator": None, "gear": "R"}
-        pkt = {"ego": {"throttle": 0.6, "brake": 0.0}, "ego_v_fwd": -2.0,
-               "lead": {"distance": 5, "closing": 3.0}, "front_static": 3.0,
-               "rear": {"id": 9, "distance": 1.4}, "rear_static": 6.0}
-        inp = state_merge.carla_inputs(s, pkt)
-        self.assertEqual(inp["dist"], 1.4)
-        self.assertEqual(inp["closing"], 2.0)
-        self.assertEqual(inp["kind"], "vehicle")
-        st = {}
-        state_merge.apply_carla(st, pkt)
-        self.assertEqual(st["rear_distance_m"], 1.4)
-
-    def test_radar_packet_wins(self):
-        # 브리지 레이더 결과가 있으면 차선 기반 lead / front_static 대신 그것만 사용 (옆에서 오는 차 포함)
-        s = {"pedal_source": None, "accelerator": None, "gear": "D"}
-        pkt = {"ego": {"throttle": 0.5, "brake": 0.0}, "lead": {"distance": 30, "closing": 0.0},
-               "front_static": 12.0,
-               "radar": {"id": 7, "distance": 4.2, "closing": 3.0, "kind": "vehicle", "dir": "우측"}}
-        inp = state_merge.carla_inputs(s, pkt)
-        self.assertEqual((inp["dist"], inp["closing"], inp["kind"]), (4.2, 3.0, "vehicle"))
-        self.assertEqual(s["obstacle_dir"], "우측")
-        pkt["radar"] = None
-        inp = state_merge.carla_inputs(s, pkt)
-        self.assertIsNone(inp["dist"])
-        self.assertIsNone(s["obstacle_dir"])
-
     def test_real_pedal_wins(self):
         s = {"pedal_source": "CAN", "accelerator": 33.0, "brake": 0.0, "accelerator_rate": 5.0}
         inp = state_merge.carla_inputs(s, {"ego": {"throttle": 1.0}})

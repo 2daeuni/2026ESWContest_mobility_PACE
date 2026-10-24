@@ -14,10 +14,6 @@ Item {
     //          "driver"  (운전석 눈높이 1.3 m 에서 앞을 보는 시점, 자차는 안 보임, 정차·주행 동일)
     //          "forward" / "wide" (추격 시점 변형)
     property string camView: "cluster"
-    // 후진 기어(R): "driver" 시점은 후방 카메라로 전환 (뒤 범퍼 위에서 뒤쪽을 봄, 주차 가이드선 + 후방 거리)
-    property bool reverse: false
-    property var rearDistance: null
-    readonly property bool rearCam: camView === "driver" && reverse
     property int msaa: SceneEnvironment.High
 
     readonly property bool driving: world ? world.driving : false
@@ -27,9 +23,7 @@ Item {
     readonly property var sc: world ? world.sc : ({})
 
     // [카메라 높이, 카메라 z(+ 뒤 / - 앞), 바라보는 z, 세로 화각]
-    // [카메라 높이, 카메라 z(+ 뒤 / - 앞), 바라보는 z, 세로 화각]
-    readonly property var camSet: rearCam ? [1.2, 2.5, 5.0, 90]
-                                  : camView === "driver" ? [1.3, -2.7, -60, 42]
+    readonly property var camSet: camView === "driver" ? [1.3, -2.7, -60, 42]
                                   : !driving ? [5.6, 8.6, 0.2, 26]
                                   : camView === "forward" ? [3.4, 7.5, -30, 34]
                                   : camView === "wide" ? [6.2, 9.6, -12, 42]
@@ -38,11 +32,10 @@ Item {
     property real camBack: camSet[1]
     property real aimZ: camSet[2]
     property real fov: camSet[3]
-    // 운전석/후방 카메라 전환은 실제 차처럼 즉시 (카메라가 차를 뚫고 지나가지 않게)
-    Behavior on camH { enabled: vis.camView !== "driver"; NumberAnimation { duration: 900; easing.type: Easing.InOutCubic } }
-    Behavior on camBack { enabled: vis.camView !== "driver"; NumberAnimation { duration: 900; easing.type: Easing.InOutCubic } }
-    Behavior on aimZ { enabled: vis.camView !== "driver"; NumberAnimation { duration: 900; easing.type: Easing.InOutCubic } }
-    Behavior on fov { enabled: vis.camView !== "driver"; NumberAnimation { duration: 900; easing.type: Easing.InOutCubic } }
+    Behavior on camH { NumberAnimation { duration: 900; easing.type: Easing.InOutCubic } }
+    Behavior on camBack { NumberAnimation { duration: 900; easing.type: Easing.InOutCubic } }
+    Behavior on aimZ { NumberAnimation { duration: 900; easing.type: Easing.InOutCubic } }
+    Behavior on fov { NumberAnimation { duration: 900; easing.type: Easing.InOutCubic } }
 
     Rectangle { anchors.fill: parent; color: world ? world.bgColor : Theme.bg }
 
@@ -65,8 +58,6 @@ Item {
         anchors.fill: parent
         importScene: vis.world
         camera: cam
-        // 실제 후방 카메라처럼 좌우 반전 (화면 왼쪽 = 차의 왼쪽)
-        transform: Scale { xScale: vis.rearCam ? -1 : 1; origin.x: v3d.width / 2 }
 
         environment: SceneEnvironment {
             backgroundMode: SceneEnvironment.Transparent
@@ -88,9 +79,7 @@ Item {
         PerspectiveCamera {
             id: cam
             position: Qt.vector3d(0, vis.camH, vis.camBack)
-            eulerRotation.x: vis.rearCam ? -Math.atan2(vis.camH - 0.2, vis.aimZ - vis.camBack) * 180 / Math.PI
-                                         : -Math.atan2(vis.camH - 0.4, vis.camBack - vis.aimZ) * 180 / Math.PI
-            eulerRotation.y: vis.rearCam ? 180 : 0
+            eulerRotation.x: -Math.atan2(vis.camH - 0.4, vis.camBack - vis.aimZ) * 180 / Math.PI
             fieldOfView: vis.fov
             clipNear: 0.5
             clipFar: 400
@@ -114,7 +103,7 @@ Item {
         readonly property var lead: (vis.world ? vis.world.leadAnchor.lead : null)
         readonly property var gap: vis.world ? vis.world.distance : null
         property point p: Qt.point(0, 0)
-        visible: vis.showLabels && !vis.rearCam && !!lead && Theme.has(gap) && vis.driving && p.y > 0 && p.y < vis.height
+        visible: vis.showLabels && !!lead && Theme.has(gap) && vis.driving && p.y > 0 && p.y < vis.height
         x: p.x - width / 2
         y: Math.max(vis.labelTop, p.y - height - 4)
         width: gapText.width + 20; height: 26; radius: 13
@@ -135,46 +124,4 @@ Item {
         }
     }
     FrameAnimation { running: gapLabel.lead !== null && vis.visible; onTriggered: gapLabel.refresh() }
-
-    // ---------- 후방 카메라 표시 ----------
-    Rectangle {
-        visible: vis.rearCam
-        x: 12; y: vis.labelTop + 6
-        width: rearTag.width + 20; height: 28; radius: 14
-        color: Qt.rgba(0.07, 0.08, 0.1, 0.72)
-        Text {
-            id: rearTag
-            anchors.centerIn: parent
-            text: "R  후방"
-            font.pixelSize: 14
-            font.weight: Font.Bold
-            color: "white"
-        }
-    }
-    Rectangle {
-        id: rearPill
-        readonly property var d: vis.rearDistance
-        readonly property color c: !Theme.has(d) ? Theme.gray : d < 0.6 ? Theme.red : d < 1.2 ? Theme.orange : d < 2.0 ? Theme.yellow : Theme.green
-        visible: vis.rearCam
-        anchors.right: parent.right
-        anchors.rightMargin: 12
-        y: vis.labelTop + 4
-        width: rearText.width + 28; height: 34; radius: 17
-        color: Theme.has(d) ? c : Qt.rgba(0.07, 0.08, 0.1, 0.72)
-        Text {
-            id: rearText
-            anchors.centerIn: parent
-            text: Theme.has(parent.d) ? (parent.d < 10 ? "후방 " + parent.d.toFixed(1) + " m" : "후방 " + parent.d.toFixed(0) + " m") : "후방 장애물 없음"
-            font.pixelSize: 16
-            font.weight: Font.Bold
-            color: "white"
-        }
-        SequentialAnimation on opacity {
-            running: vis.rearCam && Theme.has(rearPill.d) && rearPill.d < 0.6
-            loops: Animation.Infinite
-            NumberAnimation { to: 0.35; duration: 220 }
-            NumberAnimation { to: 1.0; duration: 220 }
-            onStopped: rearPill.opacity = 1
-        }
-    }
 }

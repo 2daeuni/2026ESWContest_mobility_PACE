@@ -117,7 +117,7 @@ class FFBTests(unittest.TestCase):
         self.device.upload_effect.assert_not_called()
         self.device.write.assert_any_call(ecodes.EV_FF, ecodes.FF_AUTOCENTER, 0)
         self.assertGreaterEqual(udp.sendto.call_count, 2)
-        self.assertEqual(udp.sendto.call_args.args[1], carla_bridge.UDP_DESTINATION)
+        self.assertEqual(udp.sendto.call_args.args[1], ('192.168.50.1', 5005))
         self.assertEqual(udp.sendto.call_args.args[0], b'0,100,0.2500,D')
 
 
