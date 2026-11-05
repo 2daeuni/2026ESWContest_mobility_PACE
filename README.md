@@ -200,16 +200,18 @@ CANoe의 DBC·CAPL과 VN5620을 사용해 **15종 고장 주입 및 대응 동�
 | 초기 햅틱 모터 전달력 부족 | 소형 진동모터가 페달을 통해 충분한 촉각 피드백을 전달하지 못함 | SIMAGIC P-HPR로 변경 및 USB HID 기반 제어 |
 | CARLA 충돌 후 위험도 잔류 | 장애물 미검출 상황에서 거리·TTC 값이 남음 | 장애물 미검출 시 거리·TTC 초기화 처리 |
 
-## 8. 개발 환경
+## 8. 개발 환경 (Development Environment)
 
-| 영역 | 기술 |
+| 영역 | 기술 및 개발 환경 |
 |---|---|
-| MCU Firmware | C/C++, STM32CubeIDE |
-| Safety ECU | Raspberry Pi OS, Python 3 |
+| Programming Languages | C, C++, Python 3 |
+| MCU Firmware | STM32CubeIDE, STM32 HAL |
+| Embedded Platform | Raspberry Pi 5, STM32 NUCLEO-F446RE |
+| Operating System | Raspberry Pi OS, Windows |
 | HMI | PySide6, Qt/QML |
 | Simulation | CARLA 0.9.16 |
-| CAN Validation | CANoe 18, DBC, CAPL, VN5620 |
-| Communication | Classical CAN, Ethernet UDP/TCP, USB, SPI, Bluetooth |
+| CAN Validation | CANoe 18, CAPL, DBC, Vector VN5620 |
+| Communication | Classical CAN (500 kbps), Ethernet (UDP/TCP), USB HID, SPI, Bluetooth |
 | Version Control | Git, GitHub |
 
 ## 9. 시연 영상
